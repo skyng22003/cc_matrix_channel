@@ -9,3 +9,4 @@ node_modules/
 *.env
 session.json
 scripts/toggle-dev-mcp.sh
+.superpowers/

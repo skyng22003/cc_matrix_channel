@@ -1,5 +1,6 @@
 mod access;
 mod config;
+mod fallback_reply;
 mod live_status;
 mod matrix;
 mod mcp;
@@ -194,6 +195,7 @@ async fn main() -> Result<()> {
             client,
             known_rooms.clone(),
             last_active_room.clone(),
+            access_control.clone(),
             cancel.clone(),
         );
     }

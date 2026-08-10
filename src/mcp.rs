@@ -18,7 +18,13 @@ use crate::access::{AccessControl, ChunkMode};
 use crate::config::{Config, credentials_present};
 use crate::matrix::{ChannelNotification, MatrixBridge, MatrixBridgeConfig, PermissionVerdict};
 
-const MAX_TOTAL_LENGTH: usize = 50_000;
+/// Upper bound on a message body before chunking, enforced by `reply` and `edit_message`.
+///
+/// `pub(crate)` so the missed-reply fallback path in [`crate::live_status`] can enforce the
+/// same ceiling — an explicit reply is rejected above this, and a recovered one has no
+/// business emitting an unbounded transcript tail as a chunk storm either. Same visibility
+/// bump, same reason, as [`chunk_message`].
+pub(crate) const MAX_TOTAL_LENGTH: usize = 50_000;
 const MAX_ATTACHMENT_SIZE: u64 = 20 * 1024 * 1024; // 20MB
 const MAX_FILES_PER_REPLY: usize = 10;
 
@@ -1018,7 +1024,7 @@ impl ServerHandler for MatrixChannelServer {
 
 // --- Message chunking ---
 
-fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'a str> {
+pub(crate) fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'a str> {
     if text.len() <= max_size {
         return vec![text];
     }
@@ -1126,6 +1132,7 @@ impl MatrixChannelServer {
             client,
             self.known_rooms.clone(),
             self.last_active_room.clone(),
+            self.access_control.clone(),
             self.cancel.clone(),
         );
 
