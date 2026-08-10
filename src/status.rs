@@ -303,7 +303,10 @@ pub(crate) fn read_tail(path: &Path) -> Option<String> {
 ///
 /// Hand-rolled rather than pulling in `chrono`: the format is fixed, always UTC, and this
 /// avoids adding a dependency for one field.
-fn parse_timestamp(s: &str) -> Option<SystemTime> {
+///
+/// `pub(crate)` so `fallback_reply`'s seam tests can pin a fixture "now" the same way this
+/// module's own tests do — same reason [`read_tail`] is shared rather than duplicated.
+pub(crate) fn parse_timestamp(s: &str) -> Option<SystemTime> {
     let b = s.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
@@ -479,7 +482,18 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
             None
         },
         turn_elapsed,
-        last_reply_age: if matches!(state, AgentState::Working | AgentState::Stalled) {
+        // `WaitingForUser` is included deliberately, unlike `last_tool`/`turn_elapsed`
+        // above: a finished turn is exactly when "did the room ever get answered?" becomes
+        // the interesting question, and `fallback_reply::should_post_fallback` reads this
+        // field to decide. Zeroing it here made that check dead code — the fallback fired
+        // on every turn-end, including turns that had replied perfectly well. The other
+        // consumer, `live_status::reply_anchored`, is unaffected: it is called with
+        // `working_for`, which is `None` for every non-`Working` state, and returns `None`
+        // whenever `working_for` is `None` regardless of this value.
+        last_reply_age: if matches!(
+            state,
+            AgentState::Working | AgentState::Stalled | AgentState::WaitingForUser
+        ) {
             last_reply_age
         } else {
             None
@@ -744,6 +758,40 @@ mod tests {
     fn a_non_reply_tool_does_not_set_last_reply_age() {
         let s = status_of(&[PROMPT, TOOL_USE, TOOL_RESULT], "2026-08-08T12:00:08.000Z");
 
+        assert_eq!(s.last_reply_age, None);
+    }
+
+    /// `last_reply_age` must survive into `WaitingForUser`, unlike `last_tool` and
+    /// `turn_elapsed` which are deliberately cleared for finished turns.
+    ///
+    /// A finished turn is precisely when "was the room ever answered?" matters — it is what
+    /// `fallback_reply::should_post_fallback` reads. Clearing it here once made that check
+    /// dead code, so the missed-reply fallback fired on every turn-end, replies included.
+    #[test]
+    fn a_finished_turn_still_reports_the_reply_that_landed_in_it() {
+        let s = status_of(
+            &[PROMPT, REPLY_TOOL_USE, REPLY_TOOL_RESULT, TEXT],
+            "2026-08-08T12:00:30.000Z",
+        );
+
+        assert_eq!(s.state, AgentState::WaitingForUser);
+        // REPLY_TOOL_RESULT lands at 12:00:11; "now" is 12:00:30 → 19s old.
+        assert_eq!(s.last_reply_age, Some(Duration::from_secs(19)));
+        // The fields that *are* cleared for a finished turn stay cleared.
+        assert_eq!(s.last_tool, None);
+        assert_eq!(s.turn_elapsed, None);
+    }
+
+    /// The other half: a finished turn that never replied reports no reply age, so the two
+    /// cases stay distinguishable at the seam `should_post_fallback` decides on.
+    #[test]
+    fn a_finished_turn_with_no_reply_reports_no_reply_age() {
+        let s = status_of(
+            &[PROMPT, TOOL_USE, TOOL_RESULT, TEXT],
+            "2026-08-08T12:00:30.000Z",
+        );
+
+        assert_eq!(s.state, AgentState::WaitingForUser);
         assert_eq!(s.last_reply_age, None);
     }
 

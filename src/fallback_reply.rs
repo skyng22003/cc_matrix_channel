@@ -103,6 +103,14 @@ mod tests {
         ));
     }
 
+    /// Exercises the function *in isolation*, with a synthetic `Some(duration)` this
+    /// module's real caller could not have produced: before the fix in `status.rs`,
+    /// `read_status_at` zeroed `last_reply_age` to `None` for every non-`Working`/`Stalled`
+    /// state, so a `WaitingForUser` status never carried a reply age at all and this
+    /// argument was vacuously `None` in production. That is exactly how the bug hid behind
+    /// a green test. Keep this — it still pins the function's own logic — but
+    /// [`a_turn_that_replied_then_kept_talking_does_not_trigger`] below is what proves the
+    /// real `read_status_at` -> `should_post_fallback` pipeline is correct.
     #[test]
     fn does_not_fire_when_a_reply_landed() {
         assert!(!should_post_fallback(
@@ -204,6 +212,88 @@ mod tests {
         assert_eq!(
             extract_last_turn_text(std::path::Path::new("/nonexistent/session.jsonl")),
             None
+        );
+    }
+
+    // --- Seam tests: read_status_at -> should_post_fallback ---
+    //
+    // The unit tests above feed `should_post_fallback` arguments by hand. These run the
+    // *real* pipeline the tick loop runs — a fixture transcript through
+    // `crate::status::read_status_at`, then its `AgentStatus` straight into
+    // `should_post_fallback` — because the one bug this feature shipped with lived
+    // precisely in the join between the two, where every isolated test on either side
+    // still passed.
+
+    const STALL: Duration = Duration::from_secs(300);
+
+    /// Mirrors `status::tests::status_of`: write fixture lines to a temp transcript and run
+    /// the real state machine over them, then hand the result to the real trigger — the
+    /// exact chain `live_status.rs`'s tick loop performs.
+    fn triggers_for(lines: &[&str], now: &str) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut f = File::create(&path).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        f.flush().unwrap();
+
+        let now = crate::status::parse_timestamp(now).expect("fixture timestamp");
+        let status = crate::status::read_status_at(&path, STALL, now);
+        should_post_fallback(
+            Some(AgentState::Working),
+            status.state,
+            status.last_reply_age,
+        )
+    }
+
+    // Chronologically ordered, unlike the extraction constants above, because
+    // `read_status_at` reads record order and ages as a sequence.
+    const SEAM_REPLY_TOOL_USE: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:02.000Z","message":{"content":[{"type":"tool_use","name":"mcp__matrix__reply","input":{"text":"the answer"}}]}}"#;
+    const SEAM_REPLY_TOOL_RESULT: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"content":[{"type":"tool_result"}]}}"#;
+    const SEAM_TOOL_USE: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:02.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+    const SEAM_TOOL_RESULT: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"content":[{"type":"tool_result"}]}}"#;
+    const SEAM_TEXT: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:05.000Z","message":{"content":[{"type":"text","text":"one more thing"}]}}"#;
+
+    /// The regression this whole fix exists for, at the seam that actually failed.
+    ///
+    /// A turn that *did* call `mcp__matrix__reply`, and then said one more thing before
+    /// settling — the single commonest shape of a healthy turn. It lands in
+    /// `WaitingForUser` past `TEXT_GRACE`, and the fallback must stay quiet: the room has
+    /// already been answered, and posting the trailing text would double-post every turn.
+    ///
+    /// Before the `status.rs` fix this asserted `false` and got `true`, because
+    /// `read_status_at` zeroed `last_reply_age` for `WaitingForUser`, making
+    /// `should_post_fallback`'s `last_reply_age.is_none()` clause dead code.
+    #[test]
+    fn a_turn_that_replied_then_kept_talking_does_not_trigger() {
+        assert!(
+            !triggers_for(
+                &[
+                    PROMPT,
+                    SEAM_REPLY_TOOL_USE,
+                    SEAM_REPLY_TOOL_RESULT,
+                    SEAM_TEXT
+                ],
+                // Past TEXT_GRACE from SEAM_TEXT at 12:00:05 — the turn has settled.
+                "2026-08-08T12:00:30.000Z",
+            ),
+            "the reply tool landed this turn; the fallback must not post on top of it"
+        );
+    }
+
+    /// The positive control for the test above, through the same real pipeline: an
+    /// identical turn shape with the reply tool call removed. This is the genuine miss the
+    /// feature exists to catch, and it must still fire — a fix that silenced both would
+    /// look just as green.
+    #[test]
+    fn a_turn_that_never_replied_still_triggers() {
+        assert!(
+            triggers_for(
+                &[PROMPT, SEAM_TOOL_USE, SEAM_TOOL_RESULT, SEAM_TEXT],
+                "2026-08-08T12:00:30.000Z",
+            ),
+            "no reply landed this turn; the fallback is the only thing that will answer"
         );
     }
 }
