@@ -54,8 +54,12 @@ use crate::mcp::chunk_message;
 /// homeservers rate-limit sends, so this must stay comfortably above one-per-second.
 const TICK: Duration = Duration::from_secs(3);
 
-/// Matches the cap `mcp::edit_message` enforces on message bodies.
-const MAX_TOTAL_LENGTH: usize = 50_000;
+/// The cap `mcp::reply`/`mcp::edit_message` enforce on message bodies.
+///
+/// Aliased rather than re-declared: the missed-reply fallback path below now truncates to
+/// this bound specifically to match what an explicit reply would have been allowed to send,
+/// so two independent copies of the number could silently disagree.
+const MAX_TOTAL_LENGTH: usize = crate::mcp::MAX_TOTAL_LENGTH;
 
 /// How long the agent must be working before a status message is worth posting at all.
 ///
@@ -287,7 +291,16 @@ fn render_alert(status: &AgentStatus) -> String {
 
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_TOTAL_LENGTH {
-        s.truncate(MAX_TOTAL_LENGTH);
+        // Walk back to a character boundary first: `String::truncate` *panics* on an index
+        // that splits a multi-byte character. Status bodies this module renders itself are
+        // effectively ASCII, but `post_fallback_chunks` now routes arbitrary recovered
+        // message text through here, and a panic inside the tick loop would take the whole
+        // live-status task down silently.
+        let mut end = MAX_TOTAL_LENGTH;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
     }
     s
 }
@@ -368,6 +381,12 @@ async fn edit_status(
 /// an explicit one — a long recovered answer should be split, not silently cut off the
 /// way status messages are by [`truncate`]. Returns how many chunks actually sent, for
 /// logging (and for the integration test below to assert against).
+///
+/// Chunking is not the same as having no ceiling. `mcp::reply` rejects a body over
+/// [`crate::mcp::MAX_TOTAL_LENGTH`] outright before it ever chunks; this path cannot reject
+/// — there is no caller to report an error back to — so it truncates to the same bound
+/// instead. Without it a pathological turn could turn the whole 64 KB transcript tail into
+/// a chunk storm. Normal-length answers, the case chunking exists for, are untouched.
 async fn post_fallback_chunks(
     client: &Client,
     room_id: &OwnedRoomId,
@@ -377,6 +396,18 @@ async fn post_fallback_chunks(
 ) -> usize {
     let Some(room) = client.get_room(room_id) else {
         return 0;
+    };
+    let capped;
+    let text = if text.len() > crate::mcp::MAX_TOTAL_LENGTH {
+        tracing::warn!(
+            recovered_len = text.len(),
+            cap = crate::mcp::MAX_TOTAL_LENGTH,
+            "Missed-reply fallback text exceeded the reply length cap; truncating before chunking"
+        );
+        capped = truncate(text.to_string());
+        capped.as_str()
+    } else {
+        text
     };
     let mut sent = 0;
     for chunk in chunk_message(text, chunk_limit, chunk_mode) {
@@ -1123,6 +1154,27 @@ mod tests {
     fn bodies_respect_the_length_cap() {
         let long = truncate("x".repeat(MAX_TOTAL_LENGTH + 5_000));
         assert_eq!(long.len(), MAX_TOTAL_LENGTH);
+    }
+
+    /// The cap the fallback path enforces must be the same one an explicit `mcp::reply`
+    /// would have been held to — a recovered answer should not be allowed to send what a
+    /// deliberate one is rejected for.
+    #[test]
+    fn the_fallback_cap_matches_the_reply_cap() {
+        assert_eq!(MAX_TOTAL_LENGTH, crate::mcp::MAX_TOTAL_LENGTH);
+    }
+
+    /// Truncation must not panic on a multi-byte character straddling the cap. Recovered
+    /// turn text is arbitrary user-facing prose, and a panic here runs inside the tick
+    /// loop's task, where it would kill live status outright.
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        // Each 'é' is two bytes, so the cap lands mid-character for odd-length prefixes.
+        let s = truncate("é".repeat(MAX_TOTAL_LENGTH));
+        assert!(s.len() <= MAX_TOTAL_LENGTH);
+        assert!(s.len() >= MAX_TOTAL_LENGTH - 1, "should truncate, not gut");
+        // Round-tripping proves the result is still valid UTF-8 with no partial char.
+        assert!(s.chars().all(|c| c == 'é'));
     }
 
     /// Log into the throwaway `MATRIX_TEST_*` account and create a fresh room, shared by

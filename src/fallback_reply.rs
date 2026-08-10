@@ -10,6 +10,16 @@
 //! with no reply. The text extracted here goes straight back out to the room it would
 //! have gone to anyway had the reply tool been called — it is never logged or stored.
 //! See `docs/superpowers/specs/2026-08-10-missed-reply-fallback-design.md`.
+//!
+//! # Known limitation: the destination room is "most recent," not "the one that asked"
+//!
+//! Posting reuses `live_status::target_room`, which resolves to whichever room most
+//! recently talked to the bridge. That is a containment guarantee — the text can only reach
+//! a room already in conversation with the bridge, same as `check_outbound_gate` — but it
+//! is **not** a guarantee of the *right* room: if a second room pings the bridge mid-turn,
+//! the recovered answer goes there instead of to the room whose turn it answers. Accepted
+//! for the current single-user deployment, and deliberately not fixed with per-turn room
+//! tracking. Revisit if the bridge ever serves more than one conversation at a time.
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,12 +33,27 @@ use crate::status::AgentState;
 /// once on the tick that enters `WaitingForUser`, not on every tick it persists — `previous`
 /// is the tick loop's own state-before-this-tick, already threaded through for
 /// `live_status::decide`'s use.
+///
+/// # Never fires on the first tick
+///
+/// `previous.is_some()` is part of the debounce, not a redundant guard on the inequality
+/// below it. The tick loop's `previous` starts as `None` on every bridge (re)start, so
+/// without this a restart beside a transcript whose last turn happens to be sitting
+/// unreplied would re-post that turn's text — every restart, however old or already-handled
+/// that turn was. Only a `Working -> WaitingForUser` transition *observed live* counts.
+///
+/// The tradeoff is deliberate: a genuine miss in the seconds before a restart is not caught
+/// by this backstop. That was never the primary case (the misses this feature exists for
+/// happen during a normal running session), and the offline `tools/missed-reply-scan.mjs`
+/// still finds those after the fact. Re-posting stale text unprompted is the worse failure,
+/// because it is silent, repeatable, and lands in the room.
 pub(crate) fn should_post_fallback(
     previous: Option<AgentState>,
     current: AgentState,
     last_reply_age: Option<Duration>,
 ) -> bool {
     current == AgentState::WaitingForUser
+        && previous.is_some()
         && previous != Some(AgentState::WaitingForUser)
         && last_reply_age.is_none()
 }
@@ -117,6 +142,21 @@ mod tests {
             Some(AgentState::Working),
             AgentState::WaitingForUser,
             Some(Duration::from_secs(5)),
+        ));
+    }
+
+    /// The very first tick after the bridge starts must never post.
+    ///
+    /// The tick loop's `previous` begins as `None` on every (re)start. If the watched
+    /// transcript's last turn happens to be sitting unreplied at that moment — already
+    /// handled by hand, or simply stale — firing here would re-post that turn's text into
+    /// the room on every single restart. Only a transition observed live counts.
+    #[test]
+    fn does_not_fire_on_the_first_tick_after_a_restart() {
+        assert!(!should_post_fallback(
+            None,
+            AgentState::WaitingForUser,
+            None,
         ));
     }
 

@@ -13,6 +13,12 @@
 //! Everything here is metadata: state names, ages, durations, and tool *names*. Message
 //! text, tool inputs and tool outputs are never read out of the transcript and must never
 //! be added to [`AgentStatus`] — this data is published to a Matrix room.
+//!
+//! One module in the codebase reads message text, and it is deliberately not this one:
+//! [`crate::fallback_reply`] reads assistant `text` blocks (never `thinking`, never tool
+//! I/O) to recover an answer a turn failed to send, acting only on a decision this module
+//! already made from metadata alone. That module's own docs point back here; the rule above
+//! is unchanged for everything else.
 
 use std::fmt;
 use std::fs::File;

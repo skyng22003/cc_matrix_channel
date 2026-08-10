@@ -18,7 +18,13 @@ use crate::access::{AccessControl, ChunkMode};
 use crate::config::{Config, credentials_present};
 use crate::matrix::{ChannelNotification, MatrixBridge, MatrixBridgeConfig, PermissionVerdict};
 
-const MAX_TOTAL_LENGTH: usize = 50_000;
+/// Upper bound on a message body before chunking, enforced by `reply` and `edit_message`.
+///
+/// `pub(crate)` so the missed-reply fallback path in [`crate::live_status`] can enforce the
+/// same ceiling — an explicit reply is rejected above this, and a recovered one has no
+/// business emitting an unbounded transcript tail as a chunk storm either. Same visibility
+/// bump, same reason, as [`chunk_message`].
+pub(crate) const MAX_TOTAL_LENGTH: usize = 50_000;
 const MAX_ATTACHMENT_SIZE: u64 = 20 * 1024 * 1024; // 20MB
 const MAX_FILES_PER_REPLY: usize = 10;
 
