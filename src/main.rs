@@ -195,6 +195,7 @@ async fn main() -> Result<()> {
             client,
             known_rooms.clone(),
             last_active_room.clone(),
+            access_control.clone(),
             cancel.clone(),
         );
     }

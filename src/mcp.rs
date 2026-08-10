@@ -1018,7 +1018,7 @@ impl ServerHandler for MatrixChannelServer {
 
 // --- Message chunking ---
 
-fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'a str> {
+pub(crate) fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'a str> {
     if text.len() <= max_size {
         return vec![text];
     }
@@ -1126,6 +1126,7 @@ impl MatrixChannelServer {
             client,
             self.known_rooms.clone(),
             self.last_active_room.clone(),
+            self.access_control.clone(),
             self.cancel.clone(),
         );
 

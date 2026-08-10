@@ -46,6 +46,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::status::{AgentState, AgentStatus, TEXT_GRACE, read_status, stall_threshold};
 
+use crate::access::{AccessControl, ChunkMode};
+use crate::fallback_reply::{extract_last_turn_text, should_post_fallback};
+use crate::mcp::chunk_message;
+
 /// Poll cadence. Also the floor on edit frequency: every edit is a `room.send`, and
 /// homeservers rate-limit sends, so this must stay comfortably above one-per-second.
 const TICK: Duration = Duration::from_secs(3);
@@ -360,11 +364,39 @@ async fn edit_status(
     }
 }
 
+/// Post recovered turn text as a fallback reply, chunked the same way `mcp::reply` chunks
+/// an explicit one — a long recovered answer should be split, not silently cut off the
+/// way status messages are by [`truncate`]. Returns how many chunks actually sent, for
+/// logging (and for the integration test below to assert against).
+async fn post_fallback_chunks(
+    client: &Client,
+    room_id: &OwnedRoomId,
+    text: &str,
+    chunk_limit: usize,
+    chunk_mode: &ChunkMode,
+) -> usize {
+    let Some(room) = client.get_room(room_id) else {
+        return 0;
+    };
+    let mut sent = 0;
+    for chunk in chunk_message(text, chunk_limit, chunk_mode) {
+        match room
+            .send(RoomMessageEventContent::text_markdown(chunk))
+            .await
+        {
+            Ok(_) => sent += 1,
+            Err(e) => tracing::warn!("Failed to send fallback reply chunk: {e}"),
+        }
+    }
+    sent
+}
+
 /// Spawn the live-status loop. Returns immediately.
 pub fn spawn(
     client: Arc<Client>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
+    access_control: Arc<AccessControl>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -434,7 +466,7 @@ pub fn spawn(
                     ),
                     (None, _) => tracing::info!("Status transcript no longer resolvable"),
                 }
-                last_transcript = resolved;
+                last_transcript = resolved.clone();
             }
 
             if matches!(status.state, AgentState::Working) {
@@ -594,6 +626,37 @@ pub fn spawn(
                         );
                         send_status(&client, &room_id, &render_alert(&status)).await;
                     }
+                }
+            }
+
+            if should_post_fallback(previous, status.state, status.last_reply_age) {
+                match resolved
+                    .as_ref()
+                    .and_then(|(path, _)| extract_last_turn_text(path))
+                {
+                    Some(text) => match target_room(&known_rooms, &last_active_room) {
+                        Some(room_id) => {
+                            let chunk_limit = access_control.text_chunk_limit();
+                            let chunk_mode = access_control.chunk_mode();
+                            let sent = post_fallback_chunks(
+                                &client,
+                                &room_id,
+                                &text,
+                                chunk_limit,
+                                &chunk_mode,
+                            )
+                            .await;
+                            tracing::info!(
+                                room_id = %room_id,
+                                chunks_sent = sent,
+                                "Missed-reply fallback: reply tool was never called this turn, posted recovered text"
+                            );
+                        }
+                        None => {
+                            tracing::info!("Missed-reply fallback triggered but no target room yet")
+                        }
+                    },
+                    None => tracing::info!("Missed-reply fallback triggered but no text recovered"),
                 }
             }
 
@@ -1062,18 +1125,14 @@ mod tests {
         assert_eq!(long.len(), MAX_TOTAL_LENGTH);
     }
 
-    /// Exercises the real Matrix write path against a live homeserver: send a draft, edit
-    /// it in place twice, then close with a *new* message. The unit tests above only prove
-    /// `decide()` picks the right action — this proves the actions actually work.
+    /// Log into the throwaway `MATRIX_TEST_*` account and create a fresh room, shared by
+    /// the ignored live-homeserver tests below. Panics with a clear message if the env
+    /// vars aren't set.
     ///
-    /// Requires a throwaway account. Credentials come from the environment and are never
-    /// written to disk; the store goes to a temp dir, never the live one.
-    ///
-    ///   MATRIX_TEST_HOMESERVER=... MATRIX_TEST_USER=... MATRIX_TEST_PASSWORD=... \
-    ///     cargo test live_draft_cycle -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore = "requires a throwaway Matrix account"]
-    async fn live_draft_cycle_against_real_homeserver() {
+    /// Returns the `TempDir` alongside the client — the sqlite store lives there, and the
+    /// caller must keep it alive for as long as the client is in use (bind it, even if
+    /// unused directly: `let (client, room_id, _store) = homeserver_test_client().await;`).
+    async fn homeserver_test_client() -> (Client, OwnedRoomId, tempfile::TempDir) {
         let (Ok(hs), Ok(user), Ok(pass)) = (
             std::env::var("MATRIX_TEST_HOMESERVER"),
             std::env::var("MATRIX_TEST_USER"),
@@ -1108,6 +1167,23 @@ mod tests {
         let room_id = room.room_id().to_owned();
         println!("test room: {room_id}");
 
+        (client, room_id, store)
+    }
+
+    /// Exercises the real Matrix write path against a live homeserver: send a draft, edit
+    /// it in place twice, then close with a *new* message. The unit tests above only prove
+    /// `decide()` picks the right action — this proves the actions actually work.
+    ///
+    /// Requires a throwaway account. Credentials come from the environment and are never
+    /// written to disk; the store goes to a temp dir, never the live one.
+    ///
+    ///   MATRIX_TEST_HOMESERVER=... MATRIX_TEST_USER=... MATRIX_TEST_PASSWORD=... \
+    ///     cargo test live_draft_cycle -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a throwaway Matrix account"]
+    async fn live_draft_cycle_against_real_homeserver() {
+        let (client, room_id, _store) = homeserver_test_client().await;
+
         // 1. Open the draft.
         let working = render_working(&status(AgentState::Working));
         let event_id = send_status(&client, &room_id, &working)
@@ -1136,6 +1212,30 @@ mod tests {
             event_id, terminal_id,
             "the terminal message must be a new event, not an edit of the draft"
         );
+
+        client.matrix_auth().logout().await.ok();
+    }
+
+    /// Confirms `post_fallback_chunks` actually lands a message via a real homeserver —
+    /// the piece `should_post_fallback`/`extract_last_turn_text`'s unit tests in
+    /// `fallback_reply.rs` can't cover, since they're deliberately matrix-free.
+    ///
+    ///   MATRIX_TEST_HOMESERVER=... MATRIX_TEST_USER=... MATRIX_TEST_PASSWORD=... \
+    ///     cargo test missed_reply_fallback_posts -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a throwaway Matrix account"]
+    async fn missed_reply_fallback_posts_recovered_text_against_real_homeserver() {
+        let (client, room_id, _store) = homeserver_test_client().await;
+
+        let sent = post_fallback_chunks(
+            &client,
+            &room_id,
+            "the answer that never went through mcp__matrix__reply",
+            4096,
+            &ChunkMode::Newline,
+        )
+        .await;
+        assert_eq!(sent, 1, "a short message should land as a single chunk");
 
         client.matrix_auth().logout().await.ok();
     }
