@@ -1,5 +1,6 @@
 mod access;
 mod config;
+mod fallback_reply;
 mod live_status;
 mod matrix;
 mod mcp;
