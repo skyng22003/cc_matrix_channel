@@ -15,6 +15,25 @@
 //!
 //! Read [`crate::status`] for how the state itself is derived. This module only decides
 //! what to put on the wire and when.
+//!
+//! # The draft delay is a boundary, not a guarantee
+//!
+//! Any fixed delay has turns that finish just past it — the delay predicts the rest of a
+//! turn from elapsed time alone, and turns end for reasons that have nothing to do with
+//! how long they have already run. Two things narrow that residual without chasing it to
+//! zero, which would mean never drafting mid-turn at all:
+//!
+//! - [`reply_anchored`] re-times the clock from the room's own reply when there is one,
+//!   so bookkeeping after the reply doesn't read as "still running" to the delay.
+//! - The `StartDraft` arm holds the very first send of a spell for one extra
+//!   [`TICK`], sending only if the spell is still `Working` then. A turn that stops inside
+//!   that window never gets a message; one still running pays [`TICK`] of latency for it.
+//!
+//! Neither depends on the other, and neither needs a `Stop` hook: firing a hook is not
+//! itself observable in the transcript this module already reads (checked directly against
+//! a real `Stop` hook — no `attachment` record is written the way `SessionStart`'s is), so
+//! reaching the bridge from one would need new IPC. Both mechanisms below work with what
+//! `crate::status` can already see.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,12 +46,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::status::{AgentState, AgentStatus, TEXT_GRACE, read_status, stall_threshold};
 
+use crate::access::{AccessControl, ChunkMode};
+use crate::fallback_reply::{extract_last_turn_text, should_post_fallback};
+use crate::mcp::chunk_message;
+
 /// Poll cadence. Also the floor on edit frequency: every edit is a `room.send`, and
 /// homeservers rate-limit sends, so this must stay comfortably above one-per-second.
 const TICK: Duration = Duration::from_secs(3);
 
-/// Matches the cap `mcp::edit_message` enforces on message bodies.
-const MAX_TOTAL_LENGTH: usize = 50_000;
+/// The cap `mcp::reply`/`mcp::edit_message` enforce on message bodies.
+///
+/// Aliased rather than re-declared: the missed-reply fallback path below now truncates to
+/// this bound specifically to match what an explicit reply would have been allowed to send,
+/// so two independent copies of the number could silently disagree.
+const MAX_TOTAL_LENGTH: usize = crate::mcp::MAX_TOTAL_LENGTH;
 
 /// How long the agent must be working before a status message is worth posting at all.
 ///
@@ -64,7 +91,12 @@ struct Draft {
 enum Action {
     /// Nothing changed worth spending a send on.
     Nothing,
-    /// Start a new working spell: send a message and remember its event id.
+    /// Crossed the draft delay for the first time this spell. Don't send yet — see
+    /// [`decide`]'s `held_draft` parameter. The caller remembers this happened and asks
+    /// again next tick; sending only follows from a *second* consecutive crossing.
+    HoldDraft,
+    /// Start a new working spell: send a message and remember its event id. Only reached
+    /// once a spell has crossed the delay on two consecutive ticks — see [`HoldDraft`](Action::HoldDraft).
     StartDraft,
     /// Update the existing draft in place.
     EditDraft,
@@ -78,17 +110,57 @@ enum Action {
     AlertOnly,
 }
 
+/// Where a working spell's draft message currently stands.
+///
+/// Replaces what would otherwise be two separate booleans (`has_draft`, `held_draft`) on
+/// [`decide`] — besides keeping the argument count down, a plain pair of bools would admit
+/// a state, "has_draft and held_draft both true," that can never actually happen (a spell
+/// stops being held the moment it actually sends). The enum makes that state
+/// unrepresentable instead of just unreached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftState {
+    /// No draft yet, and the delay hasn't been crossed — or it has, but this is the first
+    /// crossing and it's being held one tick; see [`Action::HoldDraft`].
+    None,
+    /// The delay was crossed on a previous tick and held. If still `Working` past the
+    /// delay this tick too, the hold is confirmed and it sends.
+    Held,
+    /// A draft message is open in the room.
+    Open,
+}
+
+/// Re-anchor the spell clock on the room's own reply, when there is one.
+///
+/// `working_for` measures from the human's prompt — the whole turn, including whatever
+/// bookkeeping happens after the room has already been answered. Once
+/// [`crate::status::REPLY_TOOL_NAME`] has landed, the room isn't waiting on that clock
+/// any more; it's waiting on however long the agent keeps going *after* its own reply.
+/// `last_reply_age` is always `<=` `working_for` when the reply happened during the
+/// current spell — it can't predate the spell's own start — so this only ever pulls the
+/// clock forward, never back past a reply that hasn't happened yet.
+fn reply_anchored(
+    working_for: Option<Duration>,
+    last_reply_age: Option<Duration>,
+) -> Option<Duration> {
+    match (working_for, last_reply_age) {
+        (Some(w), Some(r)) if r < w => Some(r),
+        (w, _) => w,
+    }
+}
+
 /// Decide what to do this tick.
 ///
-/// `previous` is the state observed last tick; `has_draft` is whether a draft message is
-/// currently open; `changed` is whether the rendered body differs from what was last sent;
-/// `working_for` is how long the agent has been continuously working, or `None` if it is
-/// not working; `grace_held` is [`AgentStatus::grace_held`] — whether the current
-/// `Working` rests only on a reply that is still inside the text grace window.
+/// `previous` is the state observed last tick; `draft` is where the current spell's draft
+/// message stands — see [`DraftState`]; `changed` is whether the rendered body differs
+/// from what was last sent; `working_for` is how long the agent has been continuously
+/// working, or `None` if it is not working — already passed through [`reply_anchored`] by
+/// the caller, so this is "how long since the room last had reason to wait," not
+/// necessarily the raw turn duration; `grace_held` is [`AgentStatus::grace_held`] — whether
+/// the current `Working` rests only on a reply that is still inside the text grace window.
 fn decide(
     previous: Option<AgentState>,
     current: AgentState,
-    has_draft: bool,
+    draft: DraftState,
     changed: bool,
     working_for: Option<Duration>,
     grace_held: bool,
@@ -98,8 +170,8 @@ fn decide(
         // "No information" must never be broadcast as if it were a result.
         AgentState::Unknown => Action::Nothing,
 
-        AgentState::Working => {
-            if has_draft {
+        AgentState::Working => match draft {
+            DraftState::Open => {
                 // Suppress no-op edits: re-rendering an identical body every tick would
                 // spend homeserver quota for nothing.
                 if changed {
@@ -107,7 +179,8 @@ fn decide(
                 } else {
                     Action::Nothing
                 }
-            } else {
+            }
+            DraftState::None | DraftState::Held => {
                 // The spell clock counts the text grace window too, so a spell can cross
                 // the delay while the only evidence of work is a reply already sent — a
                 // turn of half the delay reaches it from the far side of its own reply.
@@ -122,20 +195,32 @@ fn decide(
                     draft_delay
                 };
                 if working_for.is_some_and(|d| d >= required) {
-                    Action::StartDraft
+                    // Deferred send: the first crossing only marks intent. A spell that
+                    // stops within this one extra tick never gets a message at all — the
+                    // near-miss costs nothing, because nothing went out. Any threshold
+                    // still has turns ending just past it (raising the delay only moves
+                    // the boundary), so this doesn't chase that to zero — it only removes
+                    // the ones inside one tick of it, which is where near-misses cluster.
+                    if draft == DraftState::Held {
+                        Action::StartDraft
+                    } else {
+                        Action::HoldDraft
+                    }
                 } else {
                     Action::Nothing
                 }
             }
-        }
+        },
 
         // Debounce: act once on entering the state, not every tick it persists.
         s if s.is_terminal() => {
             if previous == Some(s) {
                 Action::Nothing
-            } else if has_draft {
+            } else if draft == DraftState::Open {
                 // Only close a spell we actually opened — otherwise a bridge starting up
-                // beside an idle agent would declare "waiting for you" unprompted.
+                // beside an idle agent would declare "waiting for you" unprompted. A held
+                // (not yet sent) draft has nothing to close either, same as no draft at
+                // all — see `a_held_draft_that_stops_before_confirming_sends_nothing`.
                 Action::CloseDraft
             } else if s.needs_alert() {
                 // No draft, because the turn was short — but a short turn that ends in a
@@ -206,7 +291,16 @@ fn render_alert(status: &AgentStatus) -> String {
 
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_TOTAL_LENGTH {
-        s.truncate(MAX_TOTAL_LENGTH);
+        // Walk back to a character boundary first: `String::truncate` *panics* on an index
+        // that splits a multi-byte character. Status bodies this module renders itself are
+        // effectively ASCII, but `post_fallback_chunks` now routes arbitrary recovered
+        // message text through here, and a panic inside the tick loop would take the whole
+        // live-status task down silently.
+        let mut end = MAX_TOTAL_LENGTH;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
     }
     s
 }
@@ -283,11 +377,57 @@ async fn edit_status(
     }
 }
 
+/// Post recovered turn text as a fallback reply, chunked the same way `mcp::reply` chunks
+/// an explicit one — a long recovered answer should be split, not silently cut off the
+/// way status messages are by [`truncate`]. Returns how many chunks actually sent, for
+/// logging (and for the integration test below to assert against).
+///
+/// Chunking is not the same as having no ceiling. `mcp::reply` rejects a body over
+/// [`crate::mcp::MAX_TOTAL_LENGTH`] outright before it ever chunks; this path cannot reject
+/// — there is no caller to report an error back to — so it truncates to the same bound
+/// instead. Without it a pathological turn could turn the whole 64 KB transcript tail into
+/// a chunk storm. Normal-length answers, the case chunking exists for, are untouched.
+async fn post_fallback_chunks(
+    client: &Client,
+    room_id: &OwnedRoomId,
+    text: &str,
+    chunk_limit: usize,
+    chunk_mode: &ChunkMode,
+) -> usize {
+    let Some(room) = client.get_room(room_id) else {
+        return 0;
+    };
+    let capped;
+    let text = if text.len() > crate::mcp::MAX_TOTAL_LENGTH {
+        tracing::warn!(
+            recovered_len = text.len(),
+            cap = crate::mcp::MAX_TOTAL_LENGTH,
+            "Missed-reply fallback text exceeded the reply length cap; truncating before chunking"
+        );
+        capped = truncate(text.to_string());
+        capped.as_str()
+    } else {
+        text
+    };
+    let mut sent = 0;
+    for chunk in chunk_message(text, chunk_limit, chunk_mode) {
+        match room
+            .send(RoomMessageEventContent::text_markdown(chunk))
+            .await
+        {
+            Ok(_) => sent += 1,
+            Err(e) => tracing::warn!("Failed to send fallback reply chunk: {e}"),
+        }
+    }
+    sent
+}
+
 /// Spawn the live-status loop. Returns immediately.
 pub fn spawn(
     client: Arc<Client>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
+    access_control: Arc<AccessControl>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -325,6 +465,10 @@ pub fn spawn(
         // prompt scrolls out of the transcript tail — exactly on the long turns that need
         // a draft most.
         let mut working_since: Option<std::time::Instant> = None;
+        // True after a tick decides StartDraft but chooses to hold rather than send —
+        // see the comment at the `StartDraft` arm below. Reset whenever the spell resets,
+        // same as `working_since`: a held decision belongs to the spell that made it.
+        let mut held_draft: bool = false;
 
         loop {
             tokio::select! {
@@ -353,7 +497,7 @@ pub fn spawn(
                     ),
                     (None, _) => tracing::info!("Status transcript no longer resolvable"),
                 }
-                last_transcript = resolved;
+                last_transcript = resolved.clone();
             }
 
             if matches!(status.state, AgentState::Working) {
@@ -375,21 +519,33 @@ pub fn spawn(
                     );
                 }
                 working_since = None;
+                held_draft = false;
             }
             let working_for = working_since.map(|t| t.elapsed());
+            // The clock `decide` actually gates on: pulled forward to the room's own reply
+            // when there is one, so bookkeeping after the reply doesn't keep the turn
+            // "running" as far as the draft delay is concerned. See `reply_anchored`.
+            let anchored_for = reply_anchored(working_for, status.last_reply_age);
             let body = if matches!(status.state, AgentState::Working) {
                 render_working(&status)
             } else {
                 render_terminal(&status)
             };
             let changed = draft.as_ref().is_none_or(|d| d.rendered != body);
+            let draft_state = if draft.is_some() {
+                DraftState::Open
+            } else if held_draft {
+                DraftState::Held
+            } else {
+                DraftState::None
+            };
 
             let action = decide(
                 previous,
                 status.state,
-                draft.is_some(),
+                draft_state,
                 changed,
-                working_for,
+                anchored_for,
                 status.grace_held,
                 delay,
             );
@@ -404,6 +560,7 @@ pub fn spawn(
                     has_draft = draft.is_some(),
                     changed,
                     spell_age_secs = working_for.map(|d| d.as_secs()),
+                    anchored_age_secs = anchored_for.map(|d| d.as_secs()),
                     "Status tick"
                 );
             } else {
@@ -414,6 +571,7 @@ pub fn spawn(
                     has_draft = draft.is_some(),
                     changed,
                     spell_age_secs = working_for.map(|d| d.as_secs()),
+                    anchored_age_secs = anchored_for.map(|d| d.as_secs()),
                     draft_delay_secs = delay.as_secs(),
                     "Status decision"
                 );
@@ -422,7 +580,18 @@ pub fn spawn(
             match action {
                 Action::Nothing => {}
 
+                Action::HoldDraft => {
+                    held_draft = true;
+                    tracing::info!(
+                        spell_age_secs = working_for.map(|d| d.as_secs()),
+                        anchored_age_secs = anchored_for.map(|d| d.as_secs()),
+                        "Status draft held one tick before sending"
+                    );
+                }
+
                 Action::StartDraft => {
+                    held_draft = false;
+
                     let Some(room_id) = target_room(&known_rooms, &last_active_room) else {
                         // No room has talked to us yet; nothing to update.
                         tracing::info!("Status draft skipped: no target room yet");
@@ -491,6 +660,37 @@ pub fn spawn(
                 }
             }
 
+            if should_post_fallback(previous, status.state, status.last_reply_age) {
+                match resolved
+                    .as_ref()
+                    .and_then(|(path, _)| extract_last_turn_text(path))
+                {
+                    Some(text) => match target_room(&known_rooms, &last_active_room) {
+                        Some(room_id) => {
+                            let chunk_limit = access_control.text_chunk_limit();
+                            let chunk_mode = access_control.chunk_mode();
+                            let sent = post_fallback_chunks(
+                                &client,
+                                &room_id,
+                                &text,
+                                chunk_limit,
+                                &chunk_mode,
+                            )
+                            .await;
+                            tracing::info!(
+                                room_id = %room_id,
+                                chunks_sent = sent,
+                                "Missed-reply fallback: reply tool was never called this turn, posted recovered text"
+                            );
+                        }
+                        None => {
+                            tracing::info!("Missed-reply fallback triggered but no target room yet")
+                        }
+                    },
+                    None => tracing::info!("Missed-reply fallback triggered but no text recovered"),
+                }
+            }
+
             previous = Some(status.state);
         }
 
@@ -518,16 +718,38 @@ mod tests {
             last_tool: Some("Bash".to_string()),
             turn_elapsed: Some(Duration::from_secs(200)),
             grace_held: false,
+            last_reply_age: None,
         }
     }
 
+    /// The first tick to cross the delay does not send — see [`DraftState::Held`] on
+    /// [`decide`] and the deferred-send tests below. It marks intent and waits one more
+    /// tick.
     #[test]
-    fn first_working_tick_opens_a_draft() {
+    fn first_working_tick_holds_rather_than_sends() {
         assert_eq!(
             decide(
                 None,
                 AgentState::Working,
+                DraftState::None,
+                true,
+                Some(LONG),
                 false,
+                DELAY
+            ),
+            Action::HoldDraft
+        );
+    }
+
+    /// A second consecutive crossing — `DraftState::Held`, meaning the previous tick
+    /// already returned `HoldDraft` for this spell — is what actually sends.
+    #[test]
+    fn second_consecutive_crossing_sends() {
+        assert_eq!(
+            decide(
+                None,
+                AgentState::Working,
+                DraftState::Held,
                 true,
                 Some(LONG),
                 false,
@@ -537,13 +759,34 @@ mod tests {
         );
     }
 
+    /// A held draft that never gets confirmed — the spell ends before the next tick — must
+    /// not send anything. No draft was ever opened (`DraftState::Held`, not `Open`, because
+    /// holding never sends), so the terminal branch below has nothing to close; this is the
+    /// whole point of deferring the send. The hold itself needs no special-casing to
+    /// cancel — it just never gets asked again.
+    #[test]
+    fn a_held_draft_that_stops_before_confirming_sends_nothing() {
+        assert_eq!(
+            decide(
+                Some(AgentState::Working),
+                AgentState::WaitingForUser,
+                DraftState::Held,
+                true,
+                None,
+                false,
+                DELAY
+            ),
+            Action::Nothing
+        );
+    }
+
     #[test]
     fn subsequent_working_ticks_edit_rather_than_send() {
         assert_eq!(
             decide(
                 Some(AgentState::Working),
                 AgentState::Working,
-                true,
+                DraftState::Open,
                 true,
                 Some(LONG),
                 false,
@@ -560,7 +803,7 @@ mod tests {
             decide(
                 Some(AgentState::Working),
                 AgentState::Working,
-                true,
+                DraftState::Open,
                 false,
                 Some(LONG),
                 false,
@@ -579,7 +822,7 @@ mod tests {
             decide(
                 None,
                 AgentState::Working,
-                false,
+                DraftState::None,
                 true,
                 Some(SHORT),
                 false,
@@ -592,7 +835,7 @@ mod tests {
             decide(
                 Some(AgentState::Working),
                 AgentState::WaitingForUser,
-                false,
+                DraftState::None,
                 true,
                 None,
                 false,
@@ -612,7 +855,7 @@ mod tests {
             decide(
                 Some(AgentState::Working),
                 AgentState::Working,
-                false,
+                DraftState::None,
                 true,
                 Some(JUST_PAST_DELAY),
                 true,
@@ -625,14 +868,15 @@ mod tests {
     /// ...but waiting does tell the two apart. A spell can only outrun the turn by the
     /// grace window, so once it is a whole grace window past the delay the turn itself has
     /// genuinely run the full delay, whatever the last record happens to be. A turn that
-    /// never calls a tool still deserves its draft.
+    /// never calls a tool still deserves its draft. `DraftState::Held` isolates the
+    /// threshold computation from the separate hold-one-tick mechanic tested above.
     #[test]
     fn a_long_turn_drafts_even_if_its_last_record_is_text() {
         assert_eq!(
             decide(
                 Some(AgentState::Working),
                 AgentState::Working,
-                false,
+                DraftState::Held,
                 true,
                 Some(LONG),
                 true,
@@ -648,7 +892,7 @@ mod tests {
             decide(
                 None,
                 AgentState::Working,
-                false,
+                DraftState::Held,
                 true,
                 Some(LONG),
                 false,
@@ -668,7 +912,7 @@ mod tests {
                 decide(
                     Some(AgentState::Working),
                     bad,
-                    false,
+                    DraftState::None,
                     true,
                     None,
                     false,
@@ -692,7 +936,7 @@ mod tests {
                 decide(
                     Some(AgentState::Working),
                     terminal,
-                    true,
+                    DraftState::Open,
                     true,
                     None,
                     false,
@@ -744,7 +988,7 @@ mod tests {
             decide(
                 Some(AgentState::Working),
                 AgentState::Stalled,
-                true,
+                DraftState::Open,
                 true,
                 None,
                 false,
@@ -757,7 +1001,7 @@ mod tests {
             decide(
                 Some(AgentState::Stalled),
                 AgentState::Stalled,
-                false,
+                DraftState::None,
                 true,
                 None,
                 false,
@@ -767,31 +1011,45 @@ mod tests {
         );
     }
 
-    /// stall → recover → stall must produce exactly one announcement per entry.
+    /// stall → recover → stall must produce exactly one announcement per entry. Also
+    /// exercises `DraftState` transitions across ticks the way the real loop does: a
+    /// `HoldDraft` tick must not itself count as an announcement, only the confirmed
+    /// `StartDraft` after it.
     #[test]
     fn stall_recover_stall_fires_once_per_transition() {
-        let mut has_draft = false;
+        let mut draft_state = DraftState::None;
         let mut previous: Option<AgentState> = None;
         let mut terminals = 0;
         let mut starts = 0;
+        let mut holds = 0;
 
+        // Each recovery gets two Working ticks, not one: sending now costs a hold tick
+        // before the confirming send, so a spell needs to survive at least that long to
+        // ever reach `StartDraft` at all. A single-tick recovery is exercised separately
+        // in `a_held_draft_that_stops_before_confirming_sends_nothing` — it never sends,
+        // by design, and still alerts independently when it stalls.
         let sequence = [
             AgentState::Working,
             AgentState::Working,
             AgentState::Stalled,
             AgentState::Stalled,
             AgentState::Working,
+            AgentState::Working,
             AgentState::Stalled,
             AgentState::Stalled,
         ];
         for state in sequence {
-            match decide(previous, state, has_draft, true, Some(LONG), false, DELAY) {
+            match decide(previous, state, draft_state, true, Some(LONG), false, DELAY) {
+                Action::HoldDraft => {
+                    draft_state = DraftState::Held;
+                    holds += 1;
+                }
                 Action::StartDraft => {
-                    has_draft = true;
+                    draft_state = DraftState::Open;
                     starts += 1;
                 }
                 Action::CloseDraft | Action::AlertOnly => {
-                    has_draft = false;
+                    draft_state = DraftState::None;
                     terminals += 1;
                 }
                 Action::EditDraft | Action::Nothing => {}
@@ -799,6 +1057,10 @@ mod tests {
             previous = Some(state);
         }
 
+        assert_eq!(
+            holds, 2,
+            "one hold tick per working spell, ahead of its send"
+        );
         assert_eq!(starts, 2, "one draft per working spell");
         assert_eq!(terminals, 2, "one announcement per stall entry");
     }
@@ -811,7 +1073,7 @@ mod tests {
             decide(
                 None,
                 AgentState::WaitingForUser,
-                false,
+                DraftState::None,
                 true,
                 None,
                 false,
@@ -827,13 +1089,52 @@ mod tests {
             decide(
                 Some(AgentState::Working),
                 AgentState::Unknown,
-                true,
+                DraftState::Open,
                 true,
                 Some(LONG),
                 false,
                 DELAY
             ),
             Action::Nothing
+        );
+    }
+
+    // --- reply_anchored ---
+
+    /// The whole point: once a reply has landed, the clock the delay gates on is measured
+    /// from the reply, not the prompt — bookkeeping after the reply doesn't count as
+    /// "still running" for draft purposes.
+    #[test]
+    fn reply_anchored_pulls_the_clock_forward_to_the_reply() {
+        assert_eq!(
+            reply_anchored(Some(Duration::from_secs(60)), Some(Duration::from_secs(10))),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    /// No reply yet this spell: the anchor is a no-op, same as before fix.
+    #[test]
+    fn reply_anchored_passes_through_with_no_reply() {
+        assert_eq!(
+            reply_anchored(Some(Duration::from_secs(60)), None),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    /// Not working at all: nothing to anchor.
+    #[test]
+    fn reply_anchored_passes_through_when_not_working() {
+        assert_eq!(reply_anchored(None, Some(Duration::from_secs(10))), None);
+    }
+
+    /// Defensive: a reply age that is not shorter than the working age (it should never
+    /// predate the current spell — `status.rs` resets it on every `UserPrompt` — but this
+    /// function does not itself know that) must not push the clock *backward*.
+    #[test]
+    fn reply_anchored_never_moves_the_clock_backward() {
+        assert_eq!(
+            reply_anchored(Some(Duration::from_secs(10)), Some(Duration::from_secs(60))),
+            Some(Duration::from_secs(10))
         );
     }
 
@@ -855,18 +1156,46 @@ mod tests {
         assert_eq!(long.len(), MAX_TOTAL_LENGTH);
     }
 
-    /// Exercises the real Matrix write path against a live homeserver: send a draft, edit
-    /// it in place twice, then close with a *new* message. The unit tests above only prove
-    /// `decide()` picks the right action — this proves the actions actually work.
+    /// The cap the fallback path enforces must be the same one an explicit `mcp::reply`
+    /// would have been held to — a recovered answer should not be allowed to send what a
+    /// deliberate one is rejected for.
+    #[test]
+    fn the_fallback_cap_matches_the_reply_cap() {
+        assert_eq!(MAX_TOTAL_LENGTH, crate::mcp::MAX_TOTAL_LENGTH);
+    }
+
+    /// Truncation must not panic on a multi-byte character straddling the cap. Recovered
+    /// turn text is arbitrary user-facing prose, and a panic here runs inside the tick
+    /// loop's task, where it would kill live status outright.
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        // One ASCII byte then two-byte chars, so every char boundary lands on an *odd*
+        // index and the even cap falls strictly inside a character. Without the walk-back
+        // this input panics rather than failing an assertion.
+        let input = format!("x{}", "é".repeat(MAX_TOTAL_LENGTH));
+        assert!(
+            !input.is_char_boundary(MAX_TOTAL_LENGTH),
+            "fixture must straddle the cap, else this test proves nothing"
+        );
+
+        let s = truncate(input);
+
+        assert_eq!(
+            s.len(),
+            MAX_TOTAL_LENGTH - 1,
+            "back off by exactly one byte"
+        );
+        assert!(s.chars().skip(1).all(|c| c == 'é'), "no partial character");
+    }
+
+    /// Log into the throwaway `MATRIX_TEST_*` account and create a fresh room, shared by
+    /// the ignored live-homeserver tests below. Panics with a clear message if the env
+    /// vars aren't set.
     ///
-    /// Requires a throwaway account. Credentials come from the environment and are never
-    /// written to disk; the store goes to a temp dir, never the live one.
-    ///
-    ///   MATRIX_TEST_HOMESERVER=... MATRIX_TEST_USER=... MATRIX_TEST_PASSWORD=... \
-    ///     cargo test live_draft_cycle -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore = "requires a throwaway Matrix account"]
-    async fn live_draft_cycle_against_real_homeserver() {
+    /// Returns the `TempDir` alongside the client — the sqlite store lives there, and the
+    /// caller must keep it alive for as long as the client is in use (bind it, even if
+    /// unused directly: `let (client, room_id, _store) = homeserver_test_client().await;`).
+    async fn homeserver_test_client() -> (Client, OwnedRoomId, tempfile::TempDir) {
         let (Ok(hs), Ok(user), Ok(pass)) = (
             std::env::var("MATRIX_TEST_HOMESERVER"),
             std::env::var("MATRIX_TEST_USER"),
@@ -901,6 +1230,23 @@ mod tests {
         let room_id = room.room_id().to_owned();
         println!("test room: {room_id}");
 
+        (client, room_id, store)
+    }
+
+    /// Exercises the real Matrix write path against a live homeserver: send a draft, edit
+    /// it in place twice, then close with a *new* message. The unit tests above only prove
+    /// `decide()` picks the right action — this proves the actions actually work.
+    ///
+    /// Requires a throwaway account. Credentials come from the environment and are never
+    /// written to disk; the store goes to a temp dir, never the live one.
+    ///
+    ///   MATRIX_TEST_HOMESERVER=... MATRIX_TEST_USER=... MATRIX_TEST_PASSWORD=... \
+    ///     cargo test live_draft_cycle -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a throwaway Matrix account"]
+    async fn live_draft_cycle_against_real_homeserver() {
+        let (client, room_id, _store) = homeserver_test_client().await;
+
         // 1. Open the draft.
         let working = render_working(&status(AgentState::Working));
         let event_id = send_status(&client, &room_id, &working)
@@ -929,6 +1275,30 @@ mod tests {
             event_id, terminal_id,
             "the terminal message must be a new event, not an edit of the draft"
         );
+
+        client.matrix_auth().logout().await.ok();
+    }
+
+    /// Confirms `post_fallback_chunks` actually lands a message via a real homeserver —
+    /// the piece `should_post_fallback`/`extract_last_turn_text`'s unit tests in
+    /// `fallback_reply.rs` can't cover, since they're deliberately matrix-free.
+    ///
+    ///   MATRIX_TEST_HOMESERVER=... MATRIX_TEST_USER=... MATRIX_TEST_PASSWORD=... \
+    ///     cargo test missed_reply_fallback_posts -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a throwaway Matrix account"]
+    async fn missed_reply_fallback_posts_recovered_text_against_real_homeserver() {
+        let (client, room_id, _store) = homeserver_test_client().await;
+
+        let sent = post_fallback_chunks(
+            &client,
+            &room_id,
+            "the answer that never went through mcp__matrix__reply",
+            4096,
+            &ChunkMode::Newline,
+        )
+        .await;
+        assert_eq!(sent, 1, "a short message should land as a single chunk");
 
         client.matrix_auth().logout().await.ok();
     }

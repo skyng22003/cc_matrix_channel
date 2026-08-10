@@ -13,6 +13,12 @@
 //! Everything here is metadata: state names, ages, durations, and tool *names*. Message
 //! text, tool inputs and tool outputs are never read out of the transcript and must never
 //! be added to [`AgentStatus`] — this data is published to a Matrix room.
+//!
+//! One module in the codebase reads message text, and it is deliberately not this one:
+//! [`crate::fallback_reply`] reads assistant `text` blocks (never `thinking`, never tool
+//! I/O) to recover an answer a turn failed to send, acting only on a decision this module
+//! already made from metadata alone. That module's own docs point back here; the rule above
+//! is unchanged for everything else.
 
 use std::fmt;
 use std::fs::File;
@@ -37,6 +43,14 @@ pub const TEXT_GRACE: Duration = Duration::from_secs(10);
 
 /// Default stall threshold, overridable with `CC_MATRIX_STALL_SECS`.
 pub const DEFAULT_STALL_SECS: u64 = 300;
+
+/// The tool call that means the room has already been answered.
+///
+/// Its completion is what [`AgentStatus::last_reply_age`] measures from. A string constant
+/// rather than a Matrix type, to keep this module's stated independence from Matrix
+/// honest — it only needs the tool *name* `assistant` records already carry, the same way
+/// [`AgentStatus::last_tool`] does.
+pub const REPLY_TOOL_NAME: &str = "mcp__matrix__reply";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -105,6 +119,14 @@ pub struct AgentStatus {
     /// working: this is the one flavour of `Working` that may already be over. Callers
     /// that would spend a message on it should wait for the grace to resolve.
     pub grace_held: bool,
+    /// Age of the most recent [`REPLY_TOOL_NAME`] completion since the current turn
+    /// started. `None` if no reply has landed yet this turn.
+    ///
+    /// Exists so a caller timing "how long has this turn been running" can measure from
+    /// the reply instead of the prompt: a turn that keeps running after answering the room
+    /// has already delivered the thing the room was waiting for, and the clock a status
+    /// message is worth spending on should reflect that.
+    pub last_reply_age: Option<Duration>,
 }
 
 impl AgentStatus {
@@ -115,6 +137,7 @@ impl AgentStatus {
             last_tool: None,
             turn_elapsed: None,
             grace_held: false,
+            last_reply_age: None,
         }
     }
 
@@ -261,7 +284,7 @@ fn claude_alive() -> Option<bool> {
 
 /// Read the last `TAIL_BYTES` of the file as whole lines, dropping the leading partial
 /// line so the first record parsed is never truncated.
-fn read_tail(path: &Path) -> Option<String> {
+pub(crate) fn read_tail(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
@@ -286,7 +309,10 @@ fn read_tail(path: &Path) -> Option<String> {
 ///
 /// Hand-rolled rather than pulling in `chrono`: the format is fixed, always UTC, and this
 /// avoids adding a dependency for one field.
-fn parse_timestamp(s: &str) -> Option<SystemTime> {
+///
+/// `pub(crate)` so `fallback_reply`'s seam tests can pin a fixture "now" the same way this
+/// module's own tests do — same reason [`read_tail`] is shared rather than duplicated.
+pub(crate) fn parse_timestamp(s: &str) -> Option<SystemTime> {
     let b = s.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
@@ -371,6 +397,10 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
     let mut last_record: Option<Record> = None;
     let mut last_tool: Option<String> = None;
     let mut turn_start: Option<SystemTime> = None;
+    // Tracks a REPLY_TOOL_NAME call from its ToolUse to the ToolResult that confirms it
+    // actually landed — the send, not the call, is what answers the room.
+    let mut pending_reply = false;
+    let mut last_reply_landed: Option<SystemTime> = None;
 
     for line in tail.lines() {
         let line = line.trim();
@@ -393,10 +423,22 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
             continue;
         };
         match &record {
-            Record::ToolUse(name) => last_tool = Some(name.clone()),
+            Record::ToolUse(name) => {
+                last_tool = Some(name.clone());
+                pending_reply = name == REPLY_TOOL_NAME;
+            }
+            Record::ToolResult => {
+                if pending_reply {
+                    last_reply_landed = ts;
+                    pending_reply = false;
+                }
+            }
             Record::UserPrompt => {
                 turn_start = ts;
                 last_tool = None;
+                // A reply from a prior turn doesn't anchor this one.
+                last_reply_landed = None;
+                pending_reply = false;
             }
             _ => {}
         }
@@ -408,6 +450,7 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
     };
 
     let age = last_ts.and_then(|t| now.duration_since(t).ok());
+    let last_reply_age = last_reply_landed.and_then(|t| now.duration_since(t).ok());
 
     // `grace_held` rides along with the state so callers can tell the two kinds of
     // `Working` apart: work demonstrably in flight, versus a reply that may already be
@@ -445,6 +488,22 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
             None
         },
         turn_elapsed,
+        // `WaitingForUser` is included deliberately, unlike `last_tool`/`turn_elapsed`
+        // above: a finished turn is exactly when "did the room ever get answered?" becomes
+        // the interesting question, and `fallback_reply::should_post_fallback` reads this
+        // field to decide. Zeroing it here made that check dead code — the fallback fired
+        // on every turn-end, including turns that had replied perfectly well. The other
+        // consumer, `live_status::reply_anchored`, is unaffected: it is called with
+        // `working_for`, which is `None` for every non-`Working` state, and returns `None`
+        // whenever `working_for` is `None` regardless of this value.
+        last_reply_age: if matches!(
+            state,
+            AgentState::Working | AgentState::Stalled | AgentState::WaitingForUser
+        ) {
+            last_reply_age
+        } else {
+            None
+        },
     }
 }
 
@@ -485,6 +544,8 @@ mod tests {
     const TEXT: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:09.000Z","message":{"content":[{"type":"text","text":"here is my secret answer"}]}}"#;
     // Untimestamped bookkeeping records Claude Code interleaves with real activity.
     const NOISE: &str = r#"{"type":"mode","sessionId":"x","mode":"normal"}"#;
+    const REPLY_TOOL_USE: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:09.000Z","message":{"content":[{"type":"tool_use","name":"mcp__matrix__reply","input":{"text":"secret reply body"}}]}}"#;
+    const REPLY_TOOL_RESULT: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:11.000Z","toolUseResult":{"stdout":"ok"},"message":{"content":[{"type":"tool_result"}]}}"#;
 
     #[test]
     fn timestamp_parsing_matches_known_epoch() {
@@ -670,6 +731,110 @@ mod tests {
 
         assert_eq!(s.state, AgentState::Working);
         assert!(!s.grace_held);
+    }
+
+    /// The core signal `reply_anchored` depends on: once the reply's own tool_result has
+    /// landed, `last_reply_age` measures from it, and work continues afterward (another
+    /// tool call) so the state stays `Working` rather than settling to `WaitingForUser`.
+    #[test]
+    fn last_reply_age_measures_from_the_reply_tool_result() {
+        let later_tool_use = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:13.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"secret-command"}}]}}"#;
+        let s = status_of(
+            &[PROMPT, REPLY_TOOL_USE, REPLY_TOOL_RESULT, later_tool_use],
+            "2026-08-08T12:00:20.000Z",
+        );
+        assert_eq!(s.state, AgentState::Working);
+        // REPLY_TOOL_RESULT lands at 12:00:11; "now" is 12:00:20 → 9s old.
+        assert_eq!(s.last_reply_age, Some(Duration::from_secs(9)));
+    }
+
+    /// A reply call still in flight — no ToolResult yet — has not "landed", so it must not
+    /// anchor anything. The room hasn't been answered until the send actually completes.
+    #[test]
+    fn a_reply_still_in_flight_has_no_reply_age_yet() {
+        let s = status_of(&[PROMPT, REPLY_TOOL_USE], "2026-08-08T12:00:10.000Z");
+
+        assert_eq!(s.state, AgentState::Working);
+        assert_eq!(s.last_reply_age, None);
+    }
+
+    /// An ordinary tool call is not a reply — `last_reply_age` must stay `None` so an
+    /// unrelated `Bash` call can never masquerade as "the room has been answered".
+    #[test]
+    fn a_non_reply_tool_does_not_set_last_reply_age() {
+        let s = status_of(&[PROMPT, TOOL_USE, TOOL_RESULT], "2026-08-08T12:00:08.000Z");
+
+        assert_eq!(s.last_reply_age, None);
+    }
+
+    /// `last_reply_age` must survive into `WaitingForUser`, unlike `last_tool` and
+    /// `turn_elapsed` which are deliberately cleared for finished turns.
+    ///
+    /// A finished turn is precisely when "was the room ever answered?" matters — it is what
+    /// `fallback_reply::should_post_fallback` reads. Clearing it here once made that check
+    /// dead code, so the missed-reply fallback fired on every turn-end, replies included.
+    #[test]
+    fn a_finished_turn_still_reports_the_reply_that_landed_in_it() {
+        let s = status_of(
+            &[PROMPT, REPLY_TOOL_USE, REPLY_TOOL_RESULT, TEXT],
+            "2026-08-08T12:00:30.000Z",
+        );
+
+        assert_eq!(s.state, AgentState::WaitingForUser);
+        // REPLY_TOOL_RESULT lands at 12:00:11; "now" is 12:00:30 → 19s old.
+        assert_eq!(s.last_reply_age, Some(Duration::from_secs(19)));
+        // The fields that *are* cleared for a finished turn stay cleared.
+        assert_eq!(s.last_tool, None);
+        assert_eq!(s.turn_elapsed, None);
+    }
+
+    /// The other half: a finished turn that never replied reports no reply age, so the two
+    /// cases stay distinguishable at the seam `should_post_fallback` decides on.
+    #[test]
+    fn a_finished_turn_with_no_reply_reports_no_reply_age() {
+        let s = status_of(
+            &[PROMPT, TOOL_USE, TOOL_RESULT, TEXT],
+            "2026-08-08T12:00:30.000Z",
+        );
+
+        assert_eq!(s.state, AgentState::WaitingForUser);
+        assert_eq!(s.last_reply_age, None);
+    }
+
+    /// A reply from a prior turn must not leak into the next one — otherwise a turn that
+    /// never itself replied would still read as "already answered".
+    #[test]
+    fn a_new_prompt_clears_the_previous_turns_reply_age() {
+        let second_prompt = r#"{"type":"user","timestamp":"2026-08-08T12:01:00.000Z","message":{"content":[{"type":"text","text":"do another thing"}]}}"#;
+        let second_turn_tool_use = r#"{"type":"assistant","timestamp":"2026-08-08T12:01:05.000Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"secret-command"}}]}}"#;
+        let s = status_of(
+            &[
+                PROMPT,
+                REPLY_TOOL_USE,
+                REPLY_TOOL_RESULT,
+                second_prompt,
+                second_turn_tool_use,
+            ],
+            "2026-08-08T12:01:10.000Z",
+        );
+
+        assert_eq!(s.state, AgentState::Working);
+        assert_eq!(
+            s.last_reply_age, None,
+            "the reply belonged to the turn before this one"
+        );
+    }
+
+    /// Privacy guard, mirroring `render_contains_no_transcript_content`: the reply tool's
+    /// input text must never surface even though its *timing* now does.
+    #[test]
+    fn reply_tracking_leaks_no_reply_content() {
+        let s = status_of(
+            &[PROMPT, REPLY_TOOL_USE, REPLY_TOOL_RESULT],
+            "2026-08-08T12:00:12.000Z",
+        );
+        let rendered = s.render();
+        assert!(!rendered.contains("secret reply body"));
     }
 
     /// A session that has not been messaged since it started has no transcript yet, and
