@@ -1169,12 +1169,23 @@ mod tests {
     /// loop's task, where it would kill live status outright.
     #[test]
     fn truncation_never_splits_a_multibyte_character() {
-        // Each 'é' is two bytes, so the cap lands mid-character for odd-length prefixes.
-        let s = truncate("é".repeat(MAX_TOTAL_LENGTH));
-        assert!(s.len() <= MAX_TOTAL_LENGTH);
-        assert!(s.len() >= MAX_TOTAL_LENGTH - 1, "should truncate, not gut");
-        // Round-tripping proves the result is still valid UTF-8 with no partial char.
-        assert!(s.chars().all(|c| c == 'é'));
+        // One ASCII byte then two-byte chars, so every char boundary lands on an *odd*
+        // index and the even cap falls strictly inside a character. Without the walk-back
+        // this input panics rather than failing an assertion.
+        let input = format!("x{}", "é".repeat(MAX_TOTAL_LENGTH));
+        assert!(
+            !input.is_char_boundary(MAX_TOTAL_LENGTH),
+            "fixture must straddle the cap, else this test proves nothing"
+        );
+
+        let s = truncate(input);
+
+        assert_eq!(
+            s.len(),
+            MAX_TOTAL_LENGTH - 1,
+            "back off by exactly one byte"
+        );
+        assert!(s.chars().skip(1).all(|c| c == 'é'), "no partial character");
     }
 
     /// Log into the throwaway `MATRIX_TEST_*` account and create a fresh room, shared by
