@@ -278,7 +278,7 @@ fn claude_alive() -> Option<bool> {
 
 /// Read the last `TAIL_BYTES` of the file as whole lines, dropping the leading partial
 /// line so the first record parsed is never truncated.
-fn read_tail(path: &Path) -> Option<String> {
+pub(crate) fn read_tail(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
