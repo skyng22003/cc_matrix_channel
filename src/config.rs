@@ -37,6 +37,24 @@ pub struct Config {
     /// Optional passphrase to encrypt the SQLite E2EE store on disk — use MATRIX_STORE_PASSPHRASE env var
     #[arg(long, env = "MATRIX_STORE_PASSPHRASE", hide = true)]
     pub store_passphrase: Option<String>,
+
+    /// tmux target for the Claude Code pane this bridge is running alongside, e.g.
+    /// "claude-matrix:claude-code" — see `tools/restart-matrix.sh` for the prior art this
+    /// naming matches. Only consulted when a menu-answer reaction needs to be relayed.
+    #[arg(
+        long,
+        env = "CC_MATRIX_TMUX_PANE",
+        default_value = "claude-matrix:claude-code"
+    )]
+    pub tmux_pane: String,
+
+    /// Kill switch for the tmux keystroke-relay path. Detecting and posting pending
+    /// `AskUserQuestion`/`ExitPlanMode` prompts to Matrix always runs; actually sending a
+    /// keystroke into the tmux pane only happens when this is explicitly `true`. Defaults
+    /// `false` so a bad deploy of the relay logic can never touch the terminal without an
+    /// operator deliberately opting in.
+    #[arg(long, env = "CC_MATRIX_TMUX_ANSWERS_ENABLED", default_value_t = false)]
+    pub tmux_answers_enabled: bool,
 }
 
 impl fmt::Debug for Config {
@@ -55,6 +73,8 @@ impl fmt::Debug for Config {
                 "store_passphrase",
                 &self.store_passphrase.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("tmux_pane", &self.tmux_pane)
+            .field("tmux_answers_enabled", &self.tmux_answers_enabled)
             .finish()
     }
 }

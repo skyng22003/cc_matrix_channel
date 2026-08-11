@@ -95,6 +95,51 @@ Managed via `/matrix:access`. Changes take effect immediately.
 | `chunkMode` | `newline` | `newline` or `length` |
 | `replyToMode` | `first` | `first`, `all`, or `off` |
 
+### Menu forwarding (`AskUserQuestion`/`ExitPlanMode` over Matrix)
+
+The bridge can forward Claude Code's own blocking CLI prompts to Matrix and let you answer
+by tapping a number-emoji reaction, instead of the session hanging until someone attaches
+via `tmux`. Detection needs no bridge config beyond the two env vars below — it works by
+reading a sidecar file that a `PreToolUse`/`PostToolUse` hook writes, **not** the
+transcript (the transcript does not carry these tool calls until they're already resolved
+— confirmed live, see `tools/menu-spike/FINDINGS.md`).
+
+**Wiring the hook in** (not done automatically — a deliberate, separate step): add to the
+session's `settings.json` (project-local `.claude/settings.json` in its cwd, or
+`~/.claude/settings.json` for the whole user):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [{ "type": "command", "command": "/path/to/cc_matrix_channel/scripts/pending-prompt-hook.sh" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [{ "type": "command", "command": "/path/to/cc_matrix_channel/scripts/pending-prompt-hook.sh" }]
+      }
+    ]
+  }
+}
+```
+
+Because a project-level hook fires for *every* Claude Code session sharing that project
+directory, not just the bridge's own, the sidecar carries `session_id` and the bridge
+checks it against its own `CLAUDE_CODE_SESSION_ID` before trusting it — a foreign
+session's entry reads as if there were no pending prompt at all.
+
+| Variable | Required | Description |
+|---|---|---|
+| `CC_MATRIX_PENDING_PROMPT_PATH` | No | Overrides the sidecar path outright (default: `~/.claude/channels/matrix/pending_prompt-<session_id>.json`, namespaced per session so a second Claude Code session sharing the hook's scope can't clobber the bridge's own pending entry) — if set, must match between the hook script and the bridge process |
+| `CC_MATRIX_TMUX_PANE` | No | tmux target for answering (default: `claude-matrix:claude-code`) |
+| `CC_MATRIX_TMUX_ANSWERS_ENABLED` | No | Kill switch for the answer-relay keystroke path (default: `false` — detection/posting to Matrix always runs regardless) |
+
+Requires `jq` (the hook script's own dependency).
+
 ## Manual Install
 
 Without the plugin system:

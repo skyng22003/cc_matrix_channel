@@ -35,7 +35,7 @@
 //! reaching the bridge from one would need new IPC. Both mechanisms below work with what
 //! `crate::status` can already see.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,7 +48,9 @@ use crate::status::{AgentState, AgentStatus, TEXT_GRACE, read_status, stall_thre
 
 use crate::access::{AccessControl, ChunkMode};
 use crate::fallback_reply::{extract_last_turn_text, should_post_fallback};
+use crate::matrix::PendingAnswer;
 use crate::mcp::chunk_message;
+use crate::pending_prompt::{self, PendingPrompt, PromptKind};
 
 /// Poll cadence. Also the floor on edit frequency: every edit is a `room.send`, and
 /// homeservers rate-limit sends, so this must stay comfortably above one-per-second.
@@ -83,6 +85,44 @@ struct Draft {
     event_id: OwnedEventId,
     /// Last body actually sent, so an unchanged render does not burn homeserver quota.
     rendered: String,
+}
+
+/// Tracks the message posted for a pending `AskUserQuestion`/`ExitPlanMode` prompt.
+///
+/// Deliberately separate from [`Draft`]: a pending menu is its own single-message
+/// lifecycle (posted once, edited closed once), not part of the working-spell draft/edit
+/// cycle `decide()`/`Action`/`DraftState` already own. See the module doc's "pending
+/// prompts" note for why this lives outside `decide()` entirely, the same way the
+/// missed-reply fallback does.
+struct MenuDraft {
+    tool_use_id: String,
+    room_id: OwnedRoomId,
+    event_id: OwnedEventId,
+}
+
+/// What to do about a pending menu prompt this tick, decided from identity alone — kept
+/// pure and separate from `decide()` the same way `should_post_fallback` is, and tested
+/// exhaustively over all four `(current, pending)` shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    /// No prompt currently posted, a new one appeared — or the posted one no longer
+    /// matches the pending one (a prior prompt that never resolved through this tick loop,
+    /// defensively replaced rather than left stale).
+    Post,
+    /// A prompt was posted and it's no longer pending — resolved by reaction, by hand at
+    /// the terminal, or by `askUserQuestionTimeout`. This tick loop doesn't need to know
+    /// which; either way there's nothing left to track.
+    Clear,
+    Nothing,
+}
+
+fn menu_action(current_id: Option<&str>, pending_id: Option<&str>) -> MenuAction {
+    match (current_id, pending_id) {
+        (None, Some(_)) => MenuAction::Post,
+        (Some(cur), Some(new)) if cur != new => MenuAction::Post,
+        (Some(_), None) => MenuAction::Clear,
+        _ => MenuAction::Nothing,
+    }
 }
 
 /// The decision the state machine makes on each tick, kept separate from the Matrix calls
@@ -289,6 +329,64 @@ fn render_alert(status: &AgentStatus) -> String {
     truncate(body)
 }
 
+/// Render a pending `AskUserQuestion`/`ExitPlanMode` prompt for Matrix, including the
+/// reaction legend when it's answerable that way.
+///
+/// Posted immediately when detected — unlike [`render_working`], this never waits on
+/// [`DEFAULT_DRAFT_DELAY_SECS`] or the stall threshold. A blocked terminal is worth
+/// surfacing right away, not after the usual "has this been running a while" judgment call
+/// that exists to avoid clutter on ordinary short tool calls.
+fn render_prompt(p: &PendingPrompt) -> String {
+    let mut body = match p.kind {
+        PromptKind::AskUserQuestion => {
+            let mut b = String::from("❓ **Claude is asking**\n");
+            if let Some(h) = &p.header {
+                b.push_str(&format!("*{h}*\n"));
+            }
+            if let Some(q) = &p.question {
+                b.push_str(&format!("{q}\n"));
+            }
+            b
+        }
+        PromptKind::ExitPlanMode => {
+            let mut b = String::from("📝 **Claude wants to proceed with a plan**\n\n");
+            if let Some(plan) = &p.plan {
+                b.push_str(plan);
+            }
+            b.push('\n');
+            b
+        }
+    };
+
+    body.push('\n');
+    if p.answerable_by_reaction() {
+        // `reaction_option_count()` may be fewer than `options.len()` — currently only for
+        // `ExitPlanMode`'s trailing free-text option (see its doc). Those get plain numbers
+        // instead of a reaction emoji: they're shown for visibility, but reacting to one
+        // wouldn't actually be honored (`matrix.rs`'s `OptionOutOfRange` check refuses it).
+        let reaction_count = p.reaction_option_count();
+        for (i, opt) in p.options.iter().enumerate() {
+            if i < reaction_count {
+                let emoji = crate::matrix::NUMBER_EMOJI.get(i).copied().unwrap_or("?");
+                body.push_str(&format!("{emoji} {opt}\n"));
+            } else {
+                body.push_str(&format!("{}. {opt} _(reply at the terminal)_\n", i + 1));
+            }
+        }
+        body.push_str("\nReact with a number to answer.");
+    } else {
+        // Multi-select, multiple questions, or more options than there are keycap emoji —
+        // not guessable as a single reaction menu (see `PendingPrompt::unsupported_shape`).
+        // Posting the content is still strictly better than the prior silence; answering
+        // it just needs the terminal for now.
+        for (i, opt) in p.options.iter().enumerate() {
+            body.push_str(&format!("{}. {opt}\n", i + 1));
+        }
+        body.push_str("\n_Too many or too complex to answer by reaction — reply at the terminal._");
+    }
+    truncate(body)
+}
+
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_TOTAL_LENGTH {
         // Walk back to a character boundary first: `String::truncate` *panics* on an index
@@ -428,6 +526,7 @@ pub fn spawn(
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     access_control: Arc<AccessControl>,
+    pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -469,6 +568,9 @@ pub fn spawn(
         // see the comment at the `StartDraft` arm below. Reset whenever the spell resets,
         // same as `working_since`: a held decision belongs to the spell that made it.
         let mut held_draft: bool = false;
+        // The message tracking a pending AskUserQuestion/ExitPlanMode prompt, if any —
+        // entirely separate from `draft` above, see `MenuDraft`'s doc comment.
+        let mut menu: Option<MenuDraft> = None;
 
         loop {
             tokio::select! {
@@ -689,6 +791,107 @@ pub fn spawn(
                     },
                     None => tracing::info!("Missed-reply fallback triggered but no text recovered"),
                 }
+            }
+
+            // Pending-prompt detection and posting — an additional effect of this tick,
+            // like the fallback block above, not folded into `decide()`/`Action`. Runs
+            // every tick regardless of `status.state`/`action`: a blocked terminal is its
+            // own signal, independent of the working-spell draft machinery.
+            //
+            // Reads a hook-written sidecar file, not the transcript (`pending_prompt.rs`'s
+            // module doc has the full story — the transcript was tried first and confirmed
+            // not to carry this record until the prompt is already resolved). No longer
+            // tied to `resolved`/the transcript path at all — the sidecar's own
+            // `session_id` field is what `read_pending_prompt` checks instead.
+            let pending = pending_prompt::read_pending_prompt();
+            let current_menu_id = menu.as_ref().map(|m| m.tool_use_id.as_str());
+            let pending_id = pending.as_ref().map(|p| p.tool_use_id.as_str());
+
+            match menu_action(current_menu_id, pending_id) {
+                MenuAction::Post => {
+                    // Defensive: replacing a prior entry that never resolved through this
+                    // loop (see `MenuAction::Post`'s doc) — drop its stale pending_answers
+                    // entry so a late reaction on the old message can't claim the new one.
+                    if let Some(old) = menu.take() {
+                        pending_answers.lock().remove(&old.event_id);
+                    }
+                    let p = pending
+                        .as_ref()
+                        .expect("MenuAction::Post is only returned when pending is Some");
+                    match target_room(&known_rooms, &last_active_room) {
+                        Some(room_id) => {
+                            let body = render_prompt(p);
+                            if let Some(event_id) = send_status(&client, &room_id, &body).await {
+                                if p.answerable_by_reaction() {
+                                    pending_answers.lock().insert(
+                                        event_id.clone(),
+                                        PendingAnswer {
+                                            tool_use_id: p.tool_use_id.clone(),
+                                            kind: p.kind,
+                                            // Not `p.options.len()` — the reaction-eligible
+                                            // count, so e.g. ExitPlanMode's free-text third
+                                            // option can never be claimed by reaction (see
+                                            // `reaction_option_count`'s doc). Caught in
+                                            // code review.
+                                            option_count: p.reaction_option_count(),
+                                            room_id: room_id.clone(),
+                                        },
+                                    );
+                                    // Pre-seed the numbered reactions on our own message —
+                                    // confirmed live this matters: without an existing
+                                    // reaction to tap, answering means digging through the
+                                    // client's full emoji picker to find the right keycap
+                                    // by hand every time, instead of just tapping a pill
+                                    // that's already there.
+                                    for i in 0..p.reaction_option_count() {
+                                        let emoji = crate::matrix::NUMBER_EMOJI
+                                            .get(i)
+                                            .copied()
+                                            .unwrap_or("?");
+                                        crate::matrix::react(&client, &room_id, &event_id, emoji)
+                                            .await;
+                                    }
+                                }
+                                tracing::info!(
+                                    room_id = %room_id,
+                                    event_id = %event_id,
+                                    tool_use_id = %p.tool_use_id,
+                                    kind = ?p.kind,
+                                    answerable_by_reaction = p.answerable_by_reaction(),
+                                    "Pending prompt posted"
+                                );
+                                menu = Some(MenuDraft {
+                                    tool_use_id: p.tool_use_id.clone(),
+                                    room_id,
+                                    event_id,
+                                });
+                            }
+                        }
+                        None => tracing::info!(
+                            tool_use_id = %p.tool_use_id,
+                            "Pending prompt detected but no target room yet"
+                        ),
+                    }
+                }
+                MenuAction::Clear => {
+                    if let Some(m) = menu.take() {
+                        pending_answers.lock().remove(&m.event_id);
+                        edit_status(
+                            &client,
+                            &m.room_id,
+                            &m.event_id,
+                            "☑️ resolved (answered at the terminal or by reaction)",
+                        )
+                        .await;
+                        tracing::info!(
+                            room_id = %m.room_id,
+                            event_id = %m.event_id,
+                            tool_use_id = %m.tool_use_id,
+                            "Pending prompt resolved"
+                        );
+                    }
+                }
+                MenuAction::Nothing => {}
             }
 
             previous = Some(status.state);
@@ -1186,6 +1389,105 @@ mod tests {
             "back off by exactly one byte"
         );
         assert!(s.chars().skip(1).all(|c| c == 'é'), "no partial character");
+    }
+
+    // --- menu_action ---
+
+    #[test]
+    fn no_prompt_posted_a_new_one_appears_posts() {
+        assert_eq!(menu_action(None, Some("toolu_1")), MenuAction::Post);
+    }
+
+    #[test]
+    fn posted_prompt_resolves_clears() {
+        assert_eq!(menu_action(Some("toolu_1"), None), MenuAction::Clear);
+    }
+
+    #[test]
+    fn posted_prompt_still_pending_does_nothing() {
+        assert_eq!(
+            menu_action(Some("toolu_1"), Some("toolu_1")),
+            MenuAction::Nothing
+        );
+    }
+
+    #[test]
+    fn no_prompt_and_none_pending_does_nothing() {
+        assert_eq!(menu_action(None, None), MenuAction::Nothing);
+    }
+
+    /// Defensive case: the posted prompt's id no longer matches the pending one. Shouldn't
+    /// happen in practice (these tools block the turn), but must re-post rather than leave
+    /// a stale tracked message if it somehow does.
+    #[test]
+    fn posted_prompt_replaced_by_a_different_pending_one_posts() {
+        assert_eq!(
+            menu_action(Some("toolu_1"), Some("toolu_2")),
+            MenuAction::Post
+        );
+    }
+
+    // --- render_prompt ---
+
+    fn ask_prompt(options: &[&str]) -> PendingPrompt {
+        PendingPrompt {
+            tool_use_id: "toolu_1".to_string(),
+            kind: PromptKind::AskUserQuestion,
+            header: Some("Favorite color".to_string()),
+            question: Some("What is your favorite color?".to_string()),
+            options: options.iter().map(|s| s.to_string()).collect(),
+            plan: None,
+            unsupported_shape: false,
+        }
+    }
+
+    #[test]
+    fn render_prompt_includes_the_question_and_a_reaction_legend() {
+        let body = render_prompt(&ask_prompt(&["Red", "Green", "Blue", "Yellow"]));
+        assert!(body.contains("What is your favorite color?"));
+        assert!(body.contains("Favorite color"));
+        assert!(body.contains("1️⃣ Red"));
+        assert!(body.contains("4️⃣ Yellow"));
+        assert!(body.contains("React with a number"));
+    }
+
+    #[test]
+    fn render_prompt_falls_back_to_numbered_list_when_unsupported_shape() {
+        let mut p = ask_prompt(&["Red", "Green"]);
+        p.unsupported_shape = true;
+        let body = render_prompt(&p);
+        assert!(body.contains("1. Red"));
+        assert!(!body.contains("1️⃣"));
+        assert!(body.contains("reply at the terminal"));
+    }
+
+    #[test]
+    fn render_prompt_shows_the_plan_body_for_exit_plan_mode() {
+        let p = PendingPrompt {
+            tool_use_id: "toolu_2".to_string(),
+            kind: PromptKind::ExitPlanMode,
+            header: None,
+            question: None,
+            options: vec![
+                "Yes, and use auto mode".to_string(),
+                "Yes, manually approve edits".to_string(),
+                "Tell Claude what to change".to_string(),
+            ],
+            plan: Some("# Demo Plan\n\nSteps.".to_string()),
+            unsupported_shape: false,
+        };
+        let body = render_prompt(&p);
+        assert!(body.contains("# Demo Plan"));
+        assert!(body.contains("1️⃣ Yes, and use auto mode"));
+        assert!(body.contains("2️⃣ Yes, manually approve edits"));
+        // The free-text third option is shown for visibility but not offered as a
+        // reaction target — see `reaction_option_count`'s doc (caught in code review:
+        // nothing had confirmed live what reacting to it would actually do).
+        assert!(body.contains("3. Tell Claude what to change"));
+        assert!(
+            !body.contains("3️⃣"),
+            "the free-text option must not get a reaction emoji: {body}"
+        );
     }
 
     /// Log into the throwaway `MATRIX_TEST_*` account and create a fresh room, shared by

@@ -14,11 +14,15 @@
 //! text, tool inputs and tool outputs are never read out of the transcript and must never
 //! be added to [`AgentStatus`] — this data is published to a Matrix room.
 //!
-//! One module in the codebase reads message text, and it is deliberately not this one:
-//! [`crate::fallback_reply`] reads assistant `text` blocks (never `thinking`, never tool
-//! I/O) to recover an answer a turn failed to send, acting only on a decision this module
-//! already made from metadata alone. That module's own docs point back here; the rule above
-//! is unchanged for everything else.
+//! Two modules in the codebase read more than tool names, and it is deliberately not this
+//! one: [`crate::fallback_reply`] reads assistant `text` blocks (never `thinking`, never
+//! tool I/O) to recover an answer a turn failed to send, acting only on a decision this
+//! module already made from metadata alone; [`crate::pending_prompt`] separately reads the
+//! `input` of exactly two tool names (`AskUserQuestion`, `ExitPlanMode`) — via a hook
+//! sidecar, not this module's transcript reading, since it needs to see a prompt while
+//! still pending, before it would ever appear here. Both modules' own docs point back
+//! here; the rule above is unchanged for everything else, including for those two tools'
+//! *names*, which this module still surfaces the same as any other tool's.
 
 use std::fmt;
 use std::fs::File;
