@@ -1036,6 +1036,74 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        #[ignore = "spawns a real disposable Claude Code session; needs `claude` + `tmux` + `jq`, real API usage"]
+        async fn answer_prompt_declines_via_chat_option_on_a_real_ask_user_question() {
+            let Some((relay, project_dir, sidecar, _guard)) =
+                spawn_disposable_claude_session().await
+            else {
+                return;
+            };
+
+            relay
+                .send_keys(&[
+                    "Use the AskUserQuestion tool right now to ask me to pick a fruit from: \
+                     Apple, Banana, Cherry. Do not do anything else first.",
+                ])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            relay.send_keys(&["Enter"]).await.unwrap();
+
+            let session_id = wait_for_session_id(&project_dir, Duration::from_secs(15))
+                .await
+                .expect("a transcript should appear for the disposable session");
+            let pending = wait_for_pending_prompt(&sidecar, &session_id, Duration::from_secs(30))
+                .await
+                .expect(
+                    "the PreToolUse hook should have written the sidecar while the question \
+                     is still pending",
+                );
+            assert_eq!(pending.kind, PromptKind::AskUserQuestion);
+
+            let chat_index = pending
+                .chat_option_index()
+                .expect("AskUserQuestion always has a chat_option_index");
+            assert_eq!(
+                chat_index,
+                pending.decline_option_index() + 1,
+                "the second fixed option, one past the first"
+            );
+
+            // Same generic decline dispatch as decline_option_index (a bare digit navigates,
+            // Enter submits blank) — the point of this test is proving the *index* selects
+            // the right one, not a new keystroke path.
+            let answer = MenuAnswer {
+                tool_use_id: pending.tool_use_id.clone(),
+                kind: pending.kind,
+                option_index: chat_index,
+                option_count: pending.options.len(),
+                feedback: None,
+            };
+            let confirmed = relay
+                .answer_prompt(&answer)
+                .await
+                .expect("answer_prompt should not error");
+            assert!(confirmed, "answer_prompt should confirm the submit landed");
+
+            assert!(
+                transcript_shows_a_declined_tool_use(
+                    &project_dir,
+                    &session_id,
+                    &pending.tool_use_id,
+                    Duration::from_secs(10),
+                )
+                .await,
+                "\"Chat about this\" submitted blank should still be a real decline \
+                 (is_error: true), the same outcome as \"Type something.\" submitted blank"
+            );
+        }
+
         /// Reads the raw transcript for a `tool_result` matching `tool_use_id` that is
         /// *not* an error and whose content mentions `text` — the structural signal a
         /// reply-as-answer genuinely landed as a real answer, not a decline. Content is a

@@ -161,6 +161,26 @@ impl PendingPrompt {
             PromptKind::ExitPlanMode => self.options.len().saturating_sub(1),
         }
     }
+
+    /// `AskUserQuestion`'s *second* fixed trailing option, "Chat about this" — `None` for
+    /// `ExitPlanMode`, which has no equivalent third-plus fixed option at all.
+    ///
+    /// Submitted blank (digit + `Enter`, the same mechanism `decline_option_index` already
+    /// uses — this is not a new keystroke path, just a different target index) it declines
+    /// exactly like "Type something." does, but confirmed live to *additionally* make the
+    /// model auto-continue with a clarifying question ("What would you like to clarify?")
+    /// instead of stopping silently. Sky asked for this as its own reaction after noticing
+    /// a plain ❌ decline leaves the room waiting with nothing further to go on. Left out of
+    /// the first version of this whole feature on the (reasonable but, on reflection,
+    /// avoidable) assumption that a decline plus a follow-up reply already covers the same
+    /// ground — it doesn't quite: this prompts Claude to ask first, rather than requiring
+    /// you to know to follow up at all.
+    pub fn chat_option_index(&self) -> Option<usize> {
+        match self.kind {
+            PromptKind::AskUserQuestion => Some(self.options.len() + 1),
+            PromptKind::ExitPlanMode => None,
+        }
+    }
 }
 
 /// A sidecar older than this is treated as stale and ignored — same posture as
@@ -601,6 +621,22 @@ mod tests {
             2,
             "index 2 — \"Tell Claude what to change\", pressed with no typed feedback"
         );
+    }
+
+    #[test]
+    fn ask_user_question_chat_option_is_one_past_decline() {
+        let p = pending_of(ASK_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(
+            p.chat_option_index(),
+            Some(4),
+            "digit 5 — the second of the two fixed entries, \"Chat about this\""
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_has_no_chat_option() {
+        let p = pending_of(PLAN_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(p.chat_option_index(), None);
     }
 
     #[test]

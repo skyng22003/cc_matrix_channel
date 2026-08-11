@@ -398,7 +398,8 @@ fn render_prompt(p: &PendingPrompt) -> String {
             PromptKind::AskUserQuestion => {
                 body.push_str(
                     "\nOr use your client's Reply feature on *this* message (not a plain \
-                     new message) with your own answer.",
+                     new message) with your own answer, or 💬 to decline and have Claude \
+                     ask what you meant.",
                 );
             }
         }
@@ -876,15 +877,17 @@ pub fn spawn(
                                             // code review.
                                             option_count: p.reaction_option_count(),
                                             decline_option_index: p.decline_option_index(),
+                                            chat_option_index: p.chat_option_index(),
                                             room_id: room_id.clone(),
                                         },
                                     );
-                                    // Pre-seed the numbered reactions, then ❌, on our own
-                                    // message — confirmed live this matters: without an
-                                    // existing reaction to tap, answering means digging
-                                    // through the client's full emoji picker to find the
-                                    // right keycap by hand every time, instead of just
-                                    // tapping a pill that's already there.
+                                    // Pre-seed the numbered reactions, then ❌ (and 💬 when
+                                    // this prompt has one), on our own message — confirmed
+                                    // live this matters: without an existing reaction to
+                                    // tap, answering means digging through the client's
+                                    // full emoji picker to find the right keycap by hand
+                                    // every time, instead of just tapping a pill that's
+                                    // already there.
                                     for i in 0..p.reaction_option_count() {
                                         let emoji = crate::matrix::NUMBER_EMOJI
                                             .get(i)
@@ -900,6 +903,15 @@ pub fn spawn(
                                         crate::matrix::DECLINE_EMOJI,
                                     )
                                     .await;
+                                    if p.chat_option_index().is_some() {
+                                        crate::matrix::react(
+                                            &client,
+                                            &room_id,
+                                            &event_id,
+                                            crate::matrix::CHAT_EMOJI,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 tracing::info!(
                                     room_id = %room_id,

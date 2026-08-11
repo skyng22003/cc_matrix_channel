@@ -132,6 +132,12 @@ pub(crate) fn emoji_to_option_index(key: &str) -> Option<usize> {
 /// account, which `handle_reaction` already ignores before any emoji is even looked at.
 pub(crate) const DECLINE_EMOJI: &str = "❌";
 
+/// Reaction that declines an `AskUserQuestion` prompt but asks Claude to clarify instead of
+/// stopping silently — see `PendingPrompt::chat_option_index` for what it actually sends.
+/// Never offered for `ExitPlanMode` (that method returns `None` for it), so this can never
+/// collide with `DECLINE_EMOJI`'s meaning there.
+pub(crate) const CHAT_EMOJI: &str = "💬";
+
 /// A menu prompt currently open in the room, waiting for a reaction answer.
 ///
 /// Lives here rather than in `pending_prompt` because it's Matrix-side bookkeeping (an
@@ -148,6 +154,11 @@ pub struct PendingAnswer {
     /// `pending_prompt` at all) from just an emoji and a room. See that method's doc for
     /// why this is a different index than any numbered reaction, for both prompt kinds.
     pub decline_option_index: usize,
+    /// Carried straight from `PendingPrompt::chat_option_index` at post time, same
+    /// reasoning as `decline_option_index`. `None` for `ExitPlanMode`, which has no
+    /// equivalent option — `reaction_claims_answer` treats 💬 as not offered at all in
+    /// that case, the same as any other emoji this prompt doesn't recognize.
+    pub chat_option_index: Option<usize>,
     pub room_id: OwnedRoomId,
 }
 
@@ -229,6 +240,15 @@ fn reaction_claims_answer(
     // `option_count` the way a numbered reaction is would reject every legitimate decline.
     if emoji == DECLINE_EMOJI {
         return Ok(answer.decline_option_index);
+    }
+    // Same reasoning as decline, and same bounds-skip: `chat_option_index` sits one past
+    // even the decline index. `None` (no such option for this prompt — `ExitPlanMode`
+    // always) is treated as "not a recognized reaction here," the same as any emoji this
+    // prompt simply doesn't offer.
+    if emoji == CHAT_EMOJI {
+        return answer
+            .chat_option_index
+            .ok_or(ReactionRejection::NotANumberedReaction);
     }
     let option_index =
         emoji_to_option_index(emoji).ok_or(ReactionRejection::NotANumberedReaction)?;
@@ -1360,6 +1380,9 @@ mod tests {
             // Matches `PendingPrompt::decline_option_index`'s `AskUserQuestion` arm: one
             // past the last real option.
             decline_option_index: option_count,
+            // Matches `PendingPrompt::chat_option_index`'s `AskUserQuestion` arm: one past
+            // decline.
+            chat_option_index: Some(option_count + 1),
             room_id: room(room_id),
         }
     }
@@ -1442,6 +1465,33 @@ mod tests {
         assert_eq!(
             reaction_claims_answer(&room("!room-a:example.com"), &a, false, DECLINE_EMOJI),
             Err(ReactionRejection::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn chat_emoji_claims_the_answer_at_its_own_index_past_decline() {
+        let a = answer_in("!room:example.com", 3);
+        assert_eq!(
+            a.chat_option_index,
+            Some(4),
+            "one past decline_option_index"
+        );
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, CHAT_EMOJI),
+            Ok(4)
+        );
+    }
+
+    /// `ExitPlanMode` never offers this option (`chat_option_index` is `None`) — the
+    /// reaction is treated as unrecognized, the same as a stray emoji, not a crash or a
+    /// panic on `unwrap`.
+    #[test]
+    fn chat_emoji_is_rejected_when_the_prompt_has_no_such_option() {
+        let mut a = answer_in("!room:example.com", 3);
+        a.chat_option_index = None;
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, CHAT_EMOJI),
+            Err(ReactionRejection::NotANumberedReaction)
         );
     }
 }
