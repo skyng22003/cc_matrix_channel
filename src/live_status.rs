@@ -381,13 +381,25 @@ fn render_prompt(p: &PendingPrompt) -> String {
             // `PendingPrompt::decline_option_index`'s doc and `MatrixBridge::handle_message`'s
             // reply-with-text interception.
             PromptKind::ExitPlanMode => {
-                body.push_str("\nOr reply to *this* message to approve with feedback.");
+                body.push_str(
+                    "\nOr use your client's Reply feature on *this* message (not a plain \
+                     new message) to approve with feedback.",
+                );
             }
             // None of the numbered options fit — reply instead of picking one. Confirmed
             // live the same free-text box exists here too, just answered with a plain
             // `Enter` rather than `shift+tab` (no separate "approve" step for a question).
+            //
+            // Emphasized "not a plain new message" in both arms after a real mix-up: a
+            // plain message was sent instead of a genuine Matrix reply, forwarded as an
+            // ordinary chat message (correct, deliberate behavior — only a real reply
+            // relation claims the prompt), and read as the bridge being stuck rather than
+            // as "that wasn't a reply."
             PromptKind::AskUserQuestion => {
-                body.push_str("\nOr reply to *this* message with your own answer.");
+                body.push_str(
+                    "\nOr use your client's Reply feature on *this* message (not a plain \
+                     new message) with your own answer.",
+                );
             }
         }
     } else {
