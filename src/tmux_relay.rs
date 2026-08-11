@@ -9,11 +9,15 @@
 //! `AskUserQuestion` and `ExitPlanMode` do **not** share a keystroke protocol — confirmed
 //! by direct observation in a disposable session, see `tools/menu-spike/FINDINGS.md`:
 //!
-//! - `AskUserQuestion`: a single digit keystroke, with no `Enter`, submits that option
-//!   immediately, from wherever the cursor happens to be. Its two fixed trailing options
-//!   (beyond the model's own choices) both reject the tool call identically — no text
-//!   capture is possible through this tool at all, confirmed live
-//!   (`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section).
+//! - `AskUserQuestion`: for one of the model's own real options, a single digit keystroke
+//!   with no `Enter` submits it immediately, from wherever the cursor happens to be. Its
+//!   two fixed trailing options (beyond the model's own choices) are different, and were
+//!   first shipped on a wrong assumption that they'd behave the same way — caught live in
+//!   production, not in testing: a digit on one of *those* only navigates the cursor
+//!   there, doing nothing else, and `Enter` (with nothing typed) is what actually submits
+//!   it as a plain rejection. No text capture is possible through either fixed option, only
+//!   the reject — confirmed live, full account including the production incident in
+//!   `tools/menu-spike/FINDINGS.md`'s options-4/5/3 section.
 //! - `ExitPlanMode`: a bare digit is typed as literal text into the free-text "tell Claude
 //!   what to change" option instead of selecting anything. Needs `Up`/`Down` navigation to
 //!   the target option, then either `Enter` with nothing typed (a plain reject — the ❌
@@ -149,6 +153,50 @@ impl TmuxRelay {
         Ok(confirmed(&before, &after))
     }
 
+    /// Move `ExitPlanMode`'s cursor to `option_index` (zero-based) via `Down`, and confirm
+    /// it actually got there before returning.
+    ///
+    /// Sends each `Down` individually, with a [`SETTLE`] between, rather than batching them
+    /// into one `send-keys` call — found live this matters, not hypothetically: a decline
+    /// test (two `Down`s + `Enter`, originally sent as one burst) dropped a keystroke under
+    /// real load and landed on the wrong option, **approving** the plan it was supposed to
+    /// reject. Confirms the cursor reached the target by polling for its own `❯ N.` marker
+    /// (`N` = `option_index + 1`, the CLI's own fixed numbering — stable regardless of
+    /// which option this is, unlike `AskUserQuestion`'s), flattened the same way
+    /// [`pane_shows_expected_prompt`] already has to, for the same line-wrap reason.
+    /// Refuses rather than guesses if it never lands, the same "never send blind" posture
+    /// as everywhere else in this module — a caller that gets `Err` here has not sent
+    /// `Enter`/`shift+tab`, so nothing has been submitted on the wrong option.
+    async fn navigate_to_option(&self, option_index: usize) -> anyhow::Result<()> {
+        for _ in 0..option_index {
+            self.send_keys(&["Down"]).await?;
+            tokio::time::sleep(SETTLE).await;
+        }
+        if option_index == 0 {
+            // Every fresh ExitPlanMode prompt starts with the cursor on option 1 already
+            // (see this struct's `answer_prompt` doc for that assumption) — nothing to
+            // confirm, and the marker check below would otherwise cost a full settle for
+            // no reason on the single most common case (a real numbered "yes" answer).
+            return Ok(());
+        }
+        let marker = format!("❯ {}.", option_index + 1);
+        let deadline = tokio::time::Instant::now() + PRECONDITION_TIMEOUT;
+        loop {
+            let pane = self.capture().await?;
+            if flatten(&pane).contains(&marker) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "cursor never reached option {} after {PRECONDITION_TIMEOUT:?}; \
+                     refusing to submit blind",
+                    option_index + 1
+                );
+            }
+            tokio::time::sleep(PRECONDITION_POLL).await;
+        }
+    }
+
     /// Answer a pending menu prompt for real.
     ///
     /// Checks the pane shows the expected prompt shape (right option count — from
@@ -189,10 +237,36 @@ impl TmuxRelay {
         match answer.kind {
             PromptKind::AskUserQuestion => {
                 // Confirmed live: a single digit, no Enter, submits immediately from
-                // anywhere. The CLI numbers from 1; `option_index` is zero-based.
+                // anywhere — but only for one of the model's own real options
+                // (`option_index < option_count`). Found the hard way, live, on a real
+                // decline: the digit for the CLI's own fixed reject entry only *navigates*
+                // the cursor there — it does not submit anything on its own, unlike a real
+                // option. A caller confirmed a decline based on the pane merely changing
+                // shape (cursor moved = "changed"), the tool call was never actually
+                // resolved, and the terminal sat silently stuck with a false "confirmed" in
+                // the log. `option_index >= option_count` is exactly the same signal
+                // `reaction_claims_answer` already uses to recognize a decline (see its
+                // doc) — reused here for the keystroke protocol, not just the security
+                // check.
                 let digit = (answer.option_index + 1).to_string();
-                self.send_and_confirm(&[digit.as_str()], SETTLE, |before, after| before != after)
+                if answer.option_index < answer.option_count {
+                    self.send_and_confirm(&[digit.as_str()], SETTLE, |before, after| {
+                        before != after
+                    })
                     .await
+                } else {
+                    // Decline: digit navigates, Enter (with nothing typed) submits it as a
+                    // plain rejection — confirmed live, reproduced in a disposable session
+                    // before this fix. Settled between the two sends the same way the
+                    // ExitPlanMode feedback path is: a single digit keypress is simple
+                    // enough that a fixed settle was sufficient there once the far riskier
+                    // literal-text case needed a real poll, and this is a strictly smaller
+                    // race than that one.
+                    self.send_keys(&[digit.as_str()]).await?;
+                    tokio::time::sleep(SETTLE).await;
+                    self.send_and_confirm(&["Enter"], SETTLE, |before, after| before != after)
+                        .await
+                }
             }
             PromptKind::ExitPlanMode => {
                 if let Some(feedback) = &answer.feedback {
@@ -207,10 +281,7 @@ impl TmuxRelay {
                     // changing as expected isn't itself proof the *submit* will work), and
                     // this way `before`/`after` bracket the one keystroke that actually
                     // resolves the prompt.
-                    let nav: Vec<&str> = std::iter::repeat_n("Down", answer.option_index).collect();
-                    if !nav.is_empty() {
-                        self.send_keys(&nav).await?;
-                    }
+                    self.navigate_to_option(answer.option_index).await?;
                     self.send_literal(feedback).await?;
                     // Confirm the literal text actually landed in the free-text box before
                     // submitting — confirmed live this race is real, not hypothetical: the
@@ -247,10 +318,8 @@ impl TmuxRelay {
                     // Confirmed live: no digit shortcut, and a bare digit corrupts the
                     // free-text option instead of selecting anything (see the module doc
                     // and this method's own doc for the cursor-position caveat).
-                    let mut keys: Vec<&str> =
-                        std::iter::repeat_n("Down", answer.option_index).collect();
-                    keys.push("Enter");
-                    self.send_and_confirm(&keys, SETTLE, |before, after| before != after)
+                    self.navigate_to_option(answer.option_index).await?;
+                    self.send_and_confirm(&["Enter"], SETTLE, |before, after| before != after)
                         .await
                 }
             }
@@ -829,6 +898,118 @@ mod tests {
             );
         }
 
+        /// Reads the raw transcript for a `tool_result` matching `tool_use_id` with
+        /// `is_error: true` — the structural signal a decline actually landed, confirmed
+        /// live. Deliberately not checking the pane alone: that's exactly what the
+        /// production incident this test exists to prevent a regression of got wrong —
+        /// `send_and_confirm`'s "did the pane change at all" reported success on a digit
+        /// press that only moved the cursor, never submitting anything, and the false
+        /// `confirmed` masked a genuinely stuck terminal.
+        async fn transcript_shows_a_declined_tool_use(
+            project_dir: &Path,
+            session_id: &str,
+            tool_use_id: &str,
+            timeout: Duration,
+        ) -> bool {
+            let path = project_dir.join(format!("{session_id}.jsonl"));
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                    for line in text.lines() {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                            continue;
+                        };
+                        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array())
+                        else {
+                            continue;
+                        };
+                        let declined = blocks.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                                && b.get("tool_use_id").and_then(|t| t.as_str())
+                                    == Some(tool_use_id)
+                                && b.get("is_error").and_then(|e| e.as_bool()) == Some(true)
+                        });
+                        if declined {
+                            return true;
+                        }
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "spawns a real disposable Claude Code session; needs `claude` + `tmux` + `jq`, real API usage"]
+        async fn answer_prompt_declines_a_real_ask_user_question() {
+            let Some((relay, project_dir, sidecar, _guard)) =
+                spawn_disposable_claude_session().await
+            else {
+                return;
+            };
+
+            relay
+                .send_keys(&[
+                    "Use the AskUserQuestion tool right now to ask me to pick a fruit from: \
+                     Apple, Banana, Cherry. Do not do anything else first.",
+                ])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            relay.send_keys(&["Enter"]).await.unwrap();
+
+            let session_id = wait_for_session_id(&project_dir, Duration::from_secs(15))
+                .await
+                .expect("a transcript should appear for the disposable session");
+            let pending = wait_for_pending_prompt(&sidecar, &session_id, Duration::from_secs(30))
+                .await
+                .expect(
+                    "the PreToolUse hook should have written the sidecar while the question \
+                     is still pending",
+                );
+            assert_eq!(pending.kind, PromptKind::AskUserQuestion);
+
+            // Exactly the shape that got this wrong in production: option_index at
+            // decline_option_index() (outside 0..options.len(), the CLI's fixed reject
+            // entry), option_count at the real reaction-eligible count.
+            let answer = MenuAnswer {
+                tool_use_id: pending.tool_use_id.clone(),
+                kind: pending.kind,
+                option_index: pending.decline_option_index(),
+                option_count: pending.options.len(),
+                feedback: None,
+            };
+            let confirmed = relay
+                .answer_prompt(&answer)
+                .await
+                .expect("answer_prompt should not error");
+            assert!(
+                confirmed,
+                "answer_prompt should confirm the Enter-after-digit submit landed"
+            );
+
+            // NOT `wait_for_resolved` (the raw sidecar) here — found live that
+            // `PostToolUse` never fires for a declined tool call at all, since a rejected
+            // tool never executes, so the sidecar genuinely stays put. That's why
+            // `pending_prompt::is_resolved_in_transcript` exists as the independent
+            // resolution signal `live_status.rs` actually relies on — checked directly
+            // below via the transcript instead.
+            assert!(
+                transcript_shows_a_declined_tool_use(
+                    &project_dir,
+                    &session_id,
+                    &pending.tool_use_id,
+                    Duration::from_secs(10),
+                )
+                .await,
+                "the tool_result should be an error — proof this genuinely declined rather \
+                 than just moving the cursor and leaving the prompt stuck, which is exactly \
+                 what shipped and broke in production before this test existed"
+            );
+        }
+
         #[tokio::test]
         #[ignore = "spawns a real disposable Claude Code session; needs `claude` + `tmux` + `jq`, real API usage"]
         async fn answer_prompt_confirms_a_real_exit_plan_mode() {
@@ -934,6 +1115,72 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
+        }
+
+        #[tokio::test]
+        #[ignore = "spawns a real disposable Claude Code session; needs `claude` + `tmux` + `jq`, real API usage"]
+        async fn answer_prompt_declines_a_real_exit_plan_mode() {
+            let Some((relay, project_dir, sidecar, _guard)) =
+                spawn_disposable_claude_session().await
+            else {
+                return;
+            };
+
+            relay
+                .send_keys(&[
+                    "Switch into plan mode and make a trivial 2-step plan for renaming a \
+                     variable in a nonexistent file called foo.txt, then present the plan \
+                     for approval.",
+                ])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            relay.send_keys(&["Enter"]).await.unwrap();
+
+            let session_id = wait_for_session_id(&project_dir, Duration::from_secs(15))
+                .await
+                .expect("a transcript should appear for the disposable session");
+            let pending = wait_for_pending_prompt(&sidecar, &session_id, Duration::from_secs(60))
+                .await
+                .expect(
+                    "the PreToolUse hook should have written the sidecar while the plan \
+                     approval is still pending",
+                );
+            assert_eq!(pending.kind, PromptKind::ExitPlanMode);
+
+            let answer = MenuAnswer {
+                tool_use_id: pending.tool_use_id.clone(),
+                kind: pending.kind,
+                option_index: pending.decline_option_index(),
+                option_count: pending.options.len(),
+                feedback: None,
+            };
+            let confirmed = relay
+                .answer_prompt(&answer)
+                .await
+                .expect("answer_prompt should not error");
+            assert!(
+                confirmed,
+                "answer_prompt should confirm the Down-navigate-then-Enter submit landed"
+            );
+
+            // NOT `wait_for_resolved` (the raw sidecar) here — found live that
+            // `PostToolUse` never fires for a declined tool call at all, since a rejected
+            // tool never executes, so the sidecar genuinely stays put. That's why
+            // `pending_prompt::is_resolved_in_transcript` exists as the independent
+            // resolution signal `live_status.rs` actually relies on — checked directly
+            // below via the transcript instead.
+            assert!(
+                transcript_shows_a_declined_tool_use(
+                    &project_dir,
+                    &session_id,
+                    &pending.tool_use_id,
+                    Duration::from_secs(10),
+                )
+                .await,
+                "the tool_result should be an error, proving the plan was genuinely \
+                 rejected rather than left in some in-between state"
+            );
         }
 
         #[tokio::test]

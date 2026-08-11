@@ -249,6 +249,45 @@ pub fn read_pending_prompt() -> Option<PendingPrompt> {
     read_pending_prompt_for_session_at(&path, Some(&session_id), SystemTime::now())
 }
 
+/// True if `tool_use_id` already has a resolving `tool_result` near the tail of the
+/// transcript at `transcript_path` — an independent resolution signal, meant to be
+/// cross-checked against the sidecar rather than trusted on its own (the sidecar is still
+/// what makes a prompt visible as *pending* in the first place; the transcript here only
+/// answers "has this one specific id since been resolved").
+///
+/// **Why this exists, found live, not by inspection**: `scripts/pending-prompt-hook.sh`'s
+/// `PostToolUse` half only fires when a tool call actually *executes* — a declined or
+/// rejected `AskUserQuestion`/`ExitPlanMode` never gets one at all, since a rejected tool
+/// never runs. A live decline test caught this directly: the keystroke genuinely resolved
+/// the prompt (`tool_result` with `is_error: true` landed in the transcript right away),
+/// but the sidecar was never cleared and sat there as if still pending. Left unpatched,
+/// `menu_action` in `live_status.rs` would keep reading the same `tool_use_id` as
+/// unresolved for up to [`MAX_SIDECAR_AGE`] after every decline — the Matrix message would
+/// look permanently stuck even though the terminal had already moved on to the next turn.
+/// The transcript, unlike the hook, always gets the `tool_result` regardless of whether the
+/// tool succeeded, failed, or was declined — so it's used here as the independent check the
+/// sidecar-clearing side of the hook turned out not to be reliable for.
+pub fn is_resolved_in_transcript(transcript_path: Option<&Path>, tool_use_id: &str) -> bool {
+    let Some(path) = transcript_path else {
+        return false;
+    };
+    let Some(tail) = crate::status::read_tail(path) else {
+        return false;
+    };
+    tail.lines().any(|line| {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            return false;
+        };
+        blocks.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && b.get("tool_use_id").and_then(|t| t.as_str()) == Some(tool_use_id)
+        })
+    })
+}
+
 fn build_prompt(tool_use_id: String, name: &str, input: &Value) -> Option<PendingPrompt> {
     match name {
         ASK_USER_QUESTION_TOOL => parse_ask_user_question(tool_use_id, input),
@@ -569,5 +608,66 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.to_string_lossy().contains("session-a"));
         assert!(b.to_string_lossy().contains("session-b"));
+    }
+
+    // --- is_resolved_in_transcript ---
+
+    fn transcript_with(dir: &tempfile::TempDir, lines: &[&str]) -> PathBuf {
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_declined_tool_use_is_resolved_even_though_the_hook_never_cleared_the_sidecar() {
+        // The exact shape found live: `is_error: true`, no PostToolUse ever fires for a
+        // rejected tool call — this is the transcript-side signal that has to substitute
+        // for the sidecar clearing that never happens.
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript_with(
+            &dir,
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_ask1","name":"AskUserQuestion","input":{}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_ask1","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}"#,
+            ],
+        );
+        assert!(is_resolved_in_transcript(Some(&path), "toolu_ask1"));
+    }
+
+    #[test]
+    fn a_still_pending_tool_use_with_no_result_yet_is_not_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript_with(
+            &dir,
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_ask1","name":"AskUserQuestion","input":{}}]}}"#,
+            ],
+        );
+        assert!(!is_resolved_in_transcript(Some(&path), "toolu_ask1"));
+    }
+
+    #[test]
+    fn a_different_tool_use_ids_result_does_not_resolve_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript_with(
+            &dir,
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_unrelated","content":"ok"}]}}"#,
+            ],
+        );
+        assert!(!is_resolved_in_transcript(Some(&path), "toolu_ask1"));
+    }
+
+    #[test]
+    fn no_transcript_path_is_not_resolved() {
+        assert!(!is_resolved_in_transcript(None, "toolu_ask1"));
+    }
+
+    #[test]
+    fn missing_transcript_file_is_not_resolved_not_a_crash() {
+        assert!(!is_resolved_in_transcript(
+            Some(Path::new("/nonexistent/transcript.jsonl")),
+            "toolu_ask1"
+        ));
     }
 }

@@ -806,12 +806,25 @@ pub fn spawn(
             // every tick regardless of `status.state`/`action`: a blocked terminal is its
             // own signal, independent of the working-spell draft machinery.
             //
-            // Reads a hook-written sidecar file, not the transcript (`pending_prompt.rs`'s
-            // module doc has the full story — the transcript was tried first and confirmed
-            // not to carry this record until the prompt is already resolved). No longer
-            // tied to `resolved`/the transcript path at all — the sidecar's own
-            // `session_id` field is what `read_pending_prompt` checks instead.
-            let pending = pending_prompt::read_pending_prompt();
+            // Reads a hook-written sidecar file, not the transcript, for *detection*
+            // (`pending_prompt.rs`'s module doc has the full story — the transcript was
+            // tried first and confirmed not to carry this record until the prompt is
+            // already resolved). The sidecar's own `session_id` field is what
+            // `read_pending_prompt` checks.
+            //
+            // *Resolution* is a different story, found live: the sidecar-clearing half of
+            // the hook only fires on `PostToolUse`, and a declined/rejected tool call never
+            // gets one — the tool never actually runs. Without the cross-check below, every
+            // decline would leave the sidecar (and the Matrix message) looking pending for
+            // up to `MAX_SIDECAR_AGE`, even though the terminal moved on immediately. See
+            // `pending_prompt::is_resolved_in_transcript`'s doc for the live incident that
+            // caught this.
+            let pending = pending_prompt::read_pending_prompt().filter(|p| {
+                !pending_prompt::is_resolved_in_transcript(
+                    resolved.as_ref().map(|(path, _)| path.as_path()),
+                    &p.tool_use_id,
+                )
+            });
             let current_menu_id = menu.as_ref().map(|m| m.tool_use_id.as_str());
             let pending_id = pending.as_ref().map(|p| p.tool_use_id.as_str());
 
