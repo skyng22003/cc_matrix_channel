@@ -125,6 +125,62 @@ impl PendingPrompt {
             PromptKind::AskUserQuestion => self.options.len(),
         }
     }
+
+    /// Which `tmux_relay` option index a ❌ decline reaction (or a reply-with-text) should
+    /// target — confirmed live (`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section) for
+    /// both kinds, distinct from every numbered `options[N]` entry. **The same index is a
+    /// dual-purpose free-text box, for both kinds** — submitted blank (`Enter`/`Down`s+
+    /// `Enter`) it declines; submitted with typed text it captures that text as a real
+    /// answer (`AskUserQuestion`, plain `Enter`) or approves-with-feedback (`ExitPlanMode`,
+    /// `shift+tab`) — see `MenuAnswer::feedback`'s doc for the dispatch. **This was gotten
+    /// wrong once already**: the first version of this doc claimed neither kind's fixed
+    /// option could capture text at all — the original spike tested what selecting the
+    /// option *does*, never what typing into it first does. Corrected only after Sky asked
+    /// why the label ("Type something.") wasn't being honored.
+    ///
+    /// - `AskUserQuestion`: one past the last real option. The CLI always renders two more
+    ///   fixed entries after the model's own choices ("options 4 and 5" in the common
+    ///   3-option case Sky first noticed) — this targets the first of the two,
+    ///   "Type something." (`options.len()`, i.e. digit `options.len() + 1`). The second,
+    ///   "Chat about this", was tried once out of curiosity: also declines, but
+    ///   additionally makes the model auto-continue with a clarifying question — a real
+    ///   third behavior, not wired up here (a plain decline plus a real reply already
+    ///   covers the same ground without a second keystroke path to maintain).
+    /// - `ExitPlanMode`: the last of the three fixed options ("Tell Claude what to change").
+    ///   This is `options.len() - 1` (index 2), already present in `options` unlike the
+    ///   `AskUserQuestion` case above.
+    ///
+    /// Only meaningful when [`answerable_by_reaction`] is true — callers gate both the ❌
+    /// offer and the reply-with-text path on that flag, the same as the numbered ones,
+    /// rather than guessing at an unsupported shape's real option count.
+    ///
+    /// [`answerable_by_reaction`]: PendingPrompt::answerable_by_reaction
+    pub fn decline_option_index(&self) -> usize {
+        match self.kind {
+            PromptKind::AskUserQuestion => self.options.len(),
+            PromptKind::ExitPlanMode => self.options.len().saturating_sub(1),
+        }
+    }
+
+    /// `AskUserQuestion`'s *second* fixed trailing option, "Chat about this" — `None` for
+    /// `ExitPlanMode`, which has no equivalent third-plus fixed option at all.
+    ///
+    /// Submitted blank (digit + `Enter`, the same mechanism `decline_option_index` already
+    /// uses — this is not a new keystroke path, just a different target index) it declines
+    /// exactly like "Type something." does, but confirmed live to *additionally* make the
+    /// model auto-continue with a clarifying question ("What would you like to clarify?")
+    /// instead of stopping silently. Sky asked for this as its own reaction after noticing
+    /// a plain ❌ decline leaves the room waiting with nothing further to go on. Left out of
+    /// the first version of this whole feature on the (reasonable but, on reflection,
+    /// avoidable) assumption that a decline plus a follow-up reply already covers the same
+    /// ground — it doesn't quite: this prompts Claude to ask first, rather than requiring
+    /// you to know to follow up at all.
+    pub fn chat_option_index(&self) -> Option<usize> {
+        match self.kind {
+            PromptKind::AskUserQuestion => Some(self.options.len() + 1),
+            PromptKind::ExitPlanMode => None,
+        }
+    }
 }
 
 /// A sidecar older than this is treated as stale and ignored — same posture as
@@ -219,6 +275,45 @@ pub fn read_pending_prompt() -> Option<PendingPrompt> {
     let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok()?;
     let path = pending_prompt_path(&session_id);
     read_pending_prompt_for_session_at(&path, Some(&session_id), SystemTime::now())
+}
+
+/// True if `tool_use_id` already has a resolving `tool_result` near the tail of the
+/// transcript at `transcript_path` — an independent resolution signal, meant to be
+/// cross-checked against the sidecar rather than trusted on its own (the sidecar is still
+/// what makes a prompt visible as *pending* in the first place; the transcript here only
+/// answers "has this one specific id since been resolved").
+///
+/// **Why this exists, found live, not by inspection**: `scripts/pending-prompt-hook.sh`'s
+/// `PostToolUse` half only fires when a tool call actually *executes* — a declined or
+/// rejected `AskUserQuestion`/`ExitPlanMode` never gets one at all, since a rejected tool
+/// never runs. A live decline test caught this directly: the keystroke genuinely resolved
+/// the prompt (`tool_result` with `is_error: true` landed in the transcript right away),
+/// but the sidecar was never cleared and sat there as if still pending. Left unpatched,
+/// `menu_action` in `live_status.rs` would keep reading the same `tool_use_id` as
+/// unresolved for up to [`MAX_SIDECAR_AGE`] after every decline — the Matrix message would
+/// look permanently stuck even though the terminal had already moved on to the next turn.
+/// The transcript, unlike the hook, always gets the `tool_result` regardless of whether the
+/// tool succeeded, failed, or was declined — so it's used here as the independent check the
+/// sidecar-clearing side of the hook turned out not to be reliable for.
+pub fn is_resolved_in_transcript(transcript_path: Option<&Path>, tool_use_id: &str) -> bool {
+    let Some(path) = transcript_path else {
+        return false;
+    };
+    let Some(tail) = crate::status::read_tail(path) else {
+        return false;
+    };
+    tail.lines().any(|line| {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            return false;
+        };
+        blocks.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && b.get("tool_use_id").and_then(|t| t.as_str()) == Some(tool_use_id)
+        })
+    })
 }
 
 fn build_prompt(tool_use_id: String, name: &str, input: &Value) -> Option<PendingPrompt> {
@@ -508,6 +603,43 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_question_declines_one_past_the_last_real_option() {
+        let p = pending_of(ASK_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(p.options.len(), 3);
+        assert_eq!(
+            p.decline_option_index(),
+            3,
+            "digit 4 — the first of the two fixed reject entries"
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_declines_its_own_last_option() {
+        let p = pending_of(PLAN_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(
+            p.decline_option_index(),
+            2,
+            "index 2 — \"Tell Claude what to change\", pressed with no typed feedback"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_chat_option_is_one_past_decline() {
+        let p = pending_of(ASK_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(
+            p.chat_option_index(),
+            Some(4),
+            "digit 5 — the second of the two fixed entries, \"Chat about this\""
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_has_no_chat_option() {
+        let p = pending_of(PLAN_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(p.chat_option_index(), None);
+    }
+
+    #[test]
     fn pending_prompt_path_is_namespaced_per_session_without_the_override() {
         // No override set: two different sessions must resolve to two different paths,
         // the actual fix for the sidecar-collision gap a code review caught (see
@@ -520,5 +652,66 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.to_string_lossy().contains("session-a"));
         assert!(b.to_string_lossy().contains("session-b"));
+    }
+
+    // --- is_resolved_in_transcript ---
+
+    fn transcript_with(dir: &tempfile::TempDir, lines: &[&str]) -> PathBuf {
+        let path = dir.path().join("transcript.jsonl");
+        fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_declined_tool_use_is_resolved_even_though_the_hook_never_cleared_the_sidecar() {
+        // The exact shape found live: `is_error: true`, no PostToolUse ever fires for a
+        // rejected tool call — this is the transcript-side signal that has to substitute
+        // for the sidecar clearing that never happens.
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript_with(
+            &dir,
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_ask1","name":"AskUserQuestion","input":{}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_ask1","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}"#,
+            ],
+        );
+        assert!(is_resolved_in_transcript(Some(&path), "toolu_ask1"));
+    }
+
+    #[test]
+    fn a_still_pending_tool_use_with_no_result_yet_is_not_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript_with(
+            &dir,
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_ask1","name":"AskUserQuestion","input":{}}]}}"#,
+            ],
+        );
+        assert!(!is_resolved_in_transcript(Some(&path), "toolu_ask1"));
+    }
+
+    #[test]
+    fn a_different_tool_use_ids_result_does_not_resolve_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript_with(
+            &dir,
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_unrelated","content":"ok"}]}}"#,
+            ],
+        );
+        assert!(!is_resolved_in_transcript(Some(&path), "toolu_ask1"));
+    }
+
+    #[test]
+    fn no_transcript_path_is_not_resolved() {
+        assert!(!is_resolved_in_transcript(None, "toolu_ask1"));
+    }
+
+    #[test]
+    fn missing_transcript_file_is_not_resolved_not_a_crash() {
+        assert!(!is_resolved_in_transcript(
+            Some(Path::new("/nonexistent/transcript.jsonl")),
+            "toolu_ask1"
+        ));
     }
 }

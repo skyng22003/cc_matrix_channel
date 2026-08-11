@@ -132,6 +132,27 @@ directory, not just the bridge's own, the sidecar carries `session_id` and the b
 checks it against its own `CLAUDE_CODE_SESSION_ID` before trusting it — a foreign
 session's entry reads as if there were no pending prompt at all.
 
+**Answering beyond a plain numbered choice** — confirmed live, see
+`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section:
+
+- **❌ decline** — react with ❌ (pre-seeded alongside the numbered options) to reject the
+  prompt outright, submitted blank. For `AskUserQuestion` this hits the CLI's own "Type
+  something." entry (its other trailing option, "Chat about this", also declines but
+  additionally makes Claude auto-continue with a clarifying question — not wired up
+  separately, since a decline plus a real reply already covers it); for `ExitPlanMode` it's
+  "Tell Claude what to change" with nothing typed.
+- **Reply with text** — reply (not just send a new message) to the prompt message with
+  your own text, and the bridge types it into that same free-text option instead of
+  submitting it blank:
+  - `ExitPlanMode`: submits with `shift+tab` instead of `Enter` — **approves the plan and
+    attaches your text as feedback in the same turn**, not a reject-then-retry round trip.
+  - `AskUserQuestion`: submits with plain `Enter` — **your text becomes Claude's actual
+    answer** to the question, the same as picking a real option.
+- **💬 "chat about this"** — `AskUserQuestion` only (pre-seeded alongside ❌ there, not
+  offered on `ExitPlanMode` prompts). Also declines, but Claude auto-continues with a
+  clarifying question instead of stopping silently — the difference from ❌: you don't have
+  to know to follow up, Claude asks first.
+
 | Variable | Required | Description |
 |---|---|---|
 | `CC_MATRIX_PENDING_PROMPT_PATH` | No | Overrides the sidecar path outright (default: `~/.claude/channels/matrix/pending_prompt-<session_id>.json`, namespaced per session so a second Claude Code session sharing the hook's scope can't clobber the bridge's own pending entry) — if set, must match between the hook script and the bridge process |

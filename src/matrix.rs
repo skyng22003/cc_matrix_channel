@@ -16,7 +16,9 @@ use matrix_sdk::{
             relation::Annotation,
             room::{
                 member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+                message::{
+                    MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+                },
             },
         },
         serde::Raw,
@@ -124,6 +126,18 @@ pub(crate) fn emoji_to_option_index(key: &str) -> Option<usize> {
     NUMBER_EMOJI.iter().position(|e| *e == key)
 }
 
+/// Reaction that declines a pending prompt outright — see
+/// `PendingPrompt::decline_option_index` for what it actually sends. Distinct from the
+/// bridge's own outbound ✅/❌ permission-verdict acks: those come from the bridge's own
+/// account, which `handle_reaction` already ignores before any emoji is even looked at.
+pub(crate) const DECLINE_EMOJI: &str = "❌";
+
+/// Reaction that declines an `AskUserQuestion` prompt but asks Claude to clarify instead of
+/// stopping silently — see `PendingPrompt::chat_option_index` for what it actually sends.
+/// Never offered for `ExitPlanMode` (that method returns `None` for it), so this can never
+/// collide with `DECLINE_EMOJI`'s meaning there.
+pub(crate) const CHAT_EMOJI: &str = "💬";
+
 /// A menu prompt currently open in the room, waiting for a reaction answer.
 ///
 /// Lives here rather than in `pending_prompt` because it's Matrix-side bookkeeping (an
@@ -135,11 +149,22 @@ pub struct PendingAnswer {
     pub tool_use_id: String,
     pub kind: crate::pending_prompt::PromptKind,
     pub option_count: usize,
+    /// Carried straight from `PendingPrompt::decline_option_index` at post time, so
+    /// `reaction_claims_answer` never has to reconstruct it (or reach back into
+    /// `pending_prompt` at all) from just an emoji and a room. See that method's doc for
+    /// why this is a different index than any numbered reaction, for both prompt kinds.
+    pub decline_option_index: usize,
+    /// Carried straight from `PendingPrompt::chat_option_index` at post time, same
+    /// reasoning as `decline_option_index`. `None` for `ExitPlanMode`, which has no
+    /// equivalent option — `reaction_claims_answer` treats 💬 as not offered at all in
+    /// that case, the same as any other emoji this prompt doesn't recognize.
+    pub chat_option_index: Option<usize>,
     pub room_id: OwnedRoomId,
 }
 
 /// A resolved answer to relay into the tmux pane, produced by [`MatrixBridge::handle_reaction`]
-/// and consumed by the tmux-relay task in `main.rs`.
+/// / [`MatrixBridge::handle_message`]'s reply-feedback interception, and consumed by the
+/// tmux-relay task in `main.rs`.
 #[derive(Debug, Clone)]
 pub struct MenuAnswer {
     pub tool_use_id: String,
@@ -149,6 +174,17 @@ pub struct MenuAnswer {
     /// pre-send pane-shape check has the real validated count to check against — not just
     /// a lower bound inferred from which index was picked.
     pub option_count: usize,
+    /// Set only by the reply-with-text path — `handle_message`'s reply interception,
+    /// never `handle_reaction`. `Some(text)` tells
+    /// `tmux_relay::TmuxRelay::answer_prompt` to type `text` into the free-text option
+    /// (`PendingAnswer::decline_option_index`) rather than submitting it blank
+    /// (`None`, a plain numbered or decline answer, which never types anything). What
+    /// happens next differs by kind, both confirmed live:
+    /// - `ExitPlanMode`: submits with `shift+tab` — approves the plan *and* attaches
+    ///   `text` as feedback in the same turn.
+    /// - `AskUserQuestion`: submits with plain `Enter` — `text` *is* the answer, no
+    ///   separate approve step.
+    pub feedback: Option<String>,
 }
 
 /// Why a reaction did not claim a [`PendingAnswer`] — see [`reaction_claims_answer`].
@@ -196,6 +232,23 @@ fn reaction_claims_answer(
     }
     if !access_ok {
         return Err(ReactionRejection::AccessDenied);
+    }
+    // Decline is checked before the numbered lookup and skips the `option_count` bounds
+    // check entirely: `answer.decline_option_index` is deliberately outside that range for
+    // `AskUserQuestion` (see `PendingPrompt::decline_option_index`'s doc — it targets the
+    // CLI's own fixed reject entry, one past the last real option), so bounding it against
+    // `option_count` the way a numbered reaction is would reject every legitimate decline.
+    if emoji == DECLINE_EMOJI {
+        return Ok(answer.decline_option_index);
+    }
+    // Same reasoning as decline, and same bounds-skip: `chat_option_index` sits one past
+    // even the decline index. `None` (no such option for this prompt — `ExitPlanMode`
+    // always) is treated as "not a recognized reaction here," the same as any emoji this
+    // prompt simply doesn't offer.
+    if emoji == CHAT_EMOJI {
+        return answer
+            .chat_option_index
+            .ok_or(ReactionRejection::NotANumberedReaction);
     }
     let option_index =
         emoji_to_option_index(emoji).ok_or(ReactionRejection::NotANumberedReaction)?;
@@ -649,10 +702,12 @@ impl MatrixBridge {
             known_rooms,
             last_active_room,
             start_time,
-            // Reaction-answer bookkeeping is `handle_reaction`'s concern, not this one's.
-            pending_answers: _,
-            menu_answer_tx: _,
-            tmux_answers_enabled: _,
+            // Used below by the reply-feedback interception — a reply to a still-pending
+            // `ExitPlanMode` prompt claims it the same way a reaction does, just with typed
+            // text attached. `handle_reaction` is the *other* consumer of these same three.
+            pending_answers,
+            menu_answer_tx,
+            tmux_answers_enabled,
         } = ctx;
 
         if event.sender == own_user_id {
@@ -752,6 +807,16 @@ impl MatrixBridge {
             _ => return,
         };
 
+        // Which event (if any) this message is a Matrix reply to — used below by the
+        // reply-feedback interception. `Relation::Reply` is ruma's dedicated reply variant
+        // (distinct from `Annotation`, which is reactions' own relation type); anything
+        // else (a thread reply, an edit, no relation at all) is `None` here, same as an
+        // ordinary top-level message.
+        let reply_target = match &event.content.relates_to {
+            Some(Relation::Reply { in_reply_to }) => Some(in_reply_to.event_id.clone()),
+            _ => None,
+        };
+
         // Handle bot commands before access check
         if text.starts_with('/') {
             Self::handle_bot_command(&text, &room, &own_user_id, start_time).await;
@@ -821,6 +886,53 @@ impl MatrixBridge {
                 if newly_known || room_changed {
                     let rooms = known_rooms.lock().clone();
                     crate::rooms::save(&crate::rooms::store_path(), &rooms, Some(&current_room_id));
+                }
+
+                // Reply-with-text interception — a reply to a still-pending prompt claims
+                // it the same way a reaction does, just with typed text attached instead
+                // of a numbered choice (confirmed live for both kinds — see
+                // `tools/menu-spike/FINDINGS.md`'s options-4/5/3 section):
+                // - `ExitPlanMode`: approves the plan and attaches the reply text as
+                //   feedback in the same turn, the outcome `shift+tab` produces at the
+                //   terminal.
+                // - `AskUserQuestion`: the reply text *is* the answer — the same fixed
+                //   "Type something." option that declines when submitted blank captures
+                //   whatever's typed into it as the model's real answer.
+                // Both reuse `answer.decline_option_index` as the target: it's the same
+                // free-text box either way, just a different final keystroke
+                // (`tmux_relay::TmuxRelay::answer_prompt` decides that part).
+                if let Some(target) = reply_target.clone() {
+                    let claimed = pending_answers.lock().get(&target).cloned();
+                    if let Some(answer) = claimed
+                        // Single-shot claim, same idiom `handle_reaction` uses: only the
+                        // reply that actually removes the entry proceeds.
+                        && pending_answers.lock().remove(&target).is_some()
+                    {
+                        tracing::info!(
+                            tool_use_id = %answer.tool_use_id,
+                            "Menu feedback claimed via reply"
+                        );
+                        let menu_answer = MenuAnswer {
+                            tool_use_id: answer.tool_use_id,
+                            kind: answer.kind,
+                            option_index: answer.decline_option_index,
+                            option_count: answer.option_count,
+                            feedback: Some(text.clone()),
+                        };
+                        if menu_answer_tx.send(menu_answer).await.is_err() {
+                            tracing::error!(
+                                "Menu-answer relay task is gone; feedback claimed but not delivered"
+                            );
+                        }
+                        // Same conditional-ack posture as `handle_reaction`'s: 👀 when the
+                        // kill switch would drop the keystrokes anyway, ✅ only when they
+                        // might actually reach the terminal.
+                        let emoji = if tmux_answers_enabled { "✅" } else { "👀" };
+                        let annotation = Annotation::new(event.event_id.clone(), emoji.to_string());
+                        let reaction = ReactionEventContent::new(annotation);
+                        spawn_room_send("menu-feedback ack", room.clone(), reaction);
+                        return;
+                    }
                 }
 
                 // Permission verdict interception — only for pending requests from approved users
@@ -1009,6 +1121,9 @@ impl MatrixBridge {
             kind: answer.kind,
             option_index,
             option_count: answer.option_count,
+            // Numbered and decline reactions never carry typed text — that's the
+            // reply-feedback path's job (`handle_message`), not this one's.
+            feedback: None,
         };
         if ctx.menu_answer_tx.send(menu_answer).await.is_err() {
             tracing::error!("Menu-answer relay task is gone; answer claimed but not delivered");
@@ -1262,6 +1377,12 @@ mod tests {
             tool_use_id: "toolu_test".to_string(),
             kind: crate::pending_prompt::PromptKind::AskUserQuestion,
             option_count,
+            // Matches `PendingPrompt::decline_option_index`'s `AskUserQuestion` arm: one
+            // past the last real option.
+            decline_option_index: option_count,
+            // Matches `PendingPrompt::chat_option_index`'s `AskUserQuestion` arm: one past
+            // decline.
+            chat_option_index: Some(option_count + 1),
             room_id: room(room_id),
         }
     }
@@ -1316,6 +1437,61 @@ mod tests {
         assert_eq!(
             reaction_claims_answer(&room("!room:example.com"), &a, true, "3️⃣"),
             Err(ReactionRejection::OptionOutOfRange)
+        );
+    }
+
+    /// The whole reason `decline_option_index` is checked before the numbered bounds
+    /// check: for `AskUserQuestion` it deliberately sits *outside* `option_count` (see
+    /// `PendingPrompt::decline_option_index`'s doc), so if ❌ went through the same
+    /// `>= option_count` gate as a numbered reaction, every real decline would be rejected
+    /// as `OptionOutOfRange`.
+    #[test]
+    fn decline_emoji_claims_the_answer_at_its_decline_index_even_past_option_count() {
+        let a = answer_in("!room:example.com", 3);
+        assert_eq!(a.decline_option_index, 3, "outside the 0..3 numbered range");
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, DECLINE_EMOJI),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn decline_still_checks_room_and_access_first() {
+        let a = answer_in("!room-a:example.com", 3);
+        assert_eq!(
+            reaction_claims_answer(&room("!room-b:example.com"), &a, true, DECLINE_EMOJI),
+            Err(ReactionRejection::WrongRoom)
+        );
+        assert_eq!(
+            reaction_claims_answer(&room("!room-a:example.com"), &a, false, DECLINE_EMOJI),
+            Err(ReactionRejection::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn chat_emoji_claims_the_answer_at_its_own_index_past_decline() {
+        let a = answer_in("!room:example.com", 3);
+        assert_eq!(
+            a.chat_option_index,
+            Some(4),
+            "one past decline_option_index"
+        );
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, CHAT_EMOJI),
+            Ok(4)
+        );
+    }
+
+    /// `ExitPlanMode` never offers this option (`chat_option_index` is `None`) — the
+    /// reaction is treated as unrecognized, the same as a stray emoji, not a crash or a
+    /// panic on `unwrap`.
+    #[test]
+    fn chat_emoji_is_rejected_when_the_prompt_has_no_such_option() {
+        let mut a = answer_in("!room:example.com", 3);
+        a.chat_option_index = None;
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, CHAT_EMOJI),
+            Err(ReactionRejection::NotANumberedReaction)
         );
     }
 }

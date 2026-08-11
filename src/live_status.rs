@@ -373,7 +373,36 @@ fn render_prompt(p: &PendingPrompt) -> String {
                 body.push_str(&format!("{}. {opt} _(reply at the terminal)_\n", i + 1));
             }
         }
-        body.push_str("\nReact with a number to answer.");
+        body.push_str("\nReact with a number to answer, or ❌ to decline.");
+        match p.kind {
+            // Approve, but with a change — a reaction can't express that. Confirmed live
+            // this is a genuinely different outcome from ❌ (a plain reject followed by a
+            // fresh message costs a whole extra plan/approval round trip) — see
+            // `PendingPrompt::decline_option_index`'s doc and `MatrixBridge::handle_message`'s
+            // reply-with-text interception.
+            PromptKind::ExitPlanMode => {
+                body.push_str(
+                    "\nOr use your client's Reply feature on *this* message (not a plain \
+                     new message) to approve with feedback.",
+                );
+            }
+            // None of the numbered options fit — reply instead of picking one. Confirmed
+            // live the same free-text box exists here too, just answered with a plain
+            // `Enter` rather than `shift+tab` (no separate "approve" step for a question).
+            //
+            // Emphasized "not a plain new message" in both arms after a real mix-up: a
+            // plain message was sent instead of a genuine Matrix reply, forwarded as an
+            // ordinary chat message (correct, deliberate behavior — only a real reply
+            // relation claims the prompt), and read as the bridge being stuck rather than
+            // as "that wasn't a reply."
+            PromptKind::AskUserQuestion => {
+                body.push_str(
+                    "\nOr use your client's Reply feature on *this* message (not a plain \
+                     new message) with your own answer, or 💬 to decline and have Claude \
+                     ask what you meant.",
+                );
+            }
+        }
     } else {
         // Multi-select, multiple questions, or more options than there are keycap emoji —
         // not guessable as a single reaction menu (see `PendingPrompt::unsupported_shape`).
@@ -798,12 +827,25 @@ pub fn spawn(
             // every tick regardless of `status.state`/`action`: a blocked terminal is its
             // own signal, independent of the working-spell draft machinery.
             //
-            // Reads a hook-written sidecar file, not the transcript (`pending_prompt.rs`'s
-            // module doc has the full story — the transcript was tried first and confirmed
-            // not to carry this record until the prompt is already resolved). No longer
-            // tied to `resolved`/the transcript path at all — the sidecar's own
-            // `session_id` field is what `read_pending_prompt` checks instead.
-            let pending = pending_prompt::read_pending_prompt();
+            // Reads a hook-written sidecar file, not the transcript, for *detection*
+            // (`pending_prompt.rs`'s module doc has the full story — the transcript was
+            // tried first and confirmed not to carry this record until the prompt is
+            // already resolved). The sidecar's own `session_id` field is what
+            // `read_pending_prompt` checks.
+            //
+            // *Resolution* is a different story, found live: the sidecar-clearing half of
+            // the hook only fires on `PostToolUse`, and a declined/rejected tool call never
+            // gets one — the tool never actually runs. Without the cross-check below, every
+            // decline would leave the sidecar (and the Matrix message) looking pending for
+            // up to `MAX_SIDECAR_AGE`, even though the terminal moved on immediately. See
+            // `pending_prompt::is_resolved_in_transcript`'s doc for the live incident that
+            // caught this.
+            let pending = pending_prompt::read_pending_prompt().filter(|p| {
+                !pending_prompt::is_resolved_in_transcript(
+                    resolved.as_ref().map(|(path, _)| path.as_path()),
+                    &p.tool_use_id,
+                )
+            });
             let current_menu_id = menu.as_ref().map(|m| m.tool_use_id.as_str());
             let pending_id = pending.as_ref().map(|p| p.tool_use_id.as_str());
 
@@ -834,15 +876,18 @@ pub fn spawn(
                                             // `reaction_option_count`'s doc). Caught in
                                             // code review.
                                             option_count: p.reaction_option_count(),
+                                            decline_option_index: p.decline_option_index(),
+                                            chat_option_index: p.chat_option_index(),
                                             room_id: room_id.clone(),
                                         },
                                     );
-                                    // Pre-seed the numbered reactions on our own message —
-                                    // confirmed live this matters: without an existing
-                                    // reaction to tap, answering means digging through the
-                                    // client's full emoji picker to find the right keycap
-                                    // by hand every time, instead of just tapping a pill
-                                    // that's already there.
+                                    // Pre-seed the numbered reactions, then ❌ (and 💬 when
+                                    // this prompt has one), on our own message — confirmed
+                                    // live this matters: without an existing reaction to
+                                    // tap, answering means digging through the client's
+                                    // full emoji picker to find the right keycap by hand
+                                    // every time, instead of just tapping a pill that's
+                                    // already there.
                                     for i in 0..p.reaction_option_count() {
                                         let emoji = crate::matrix::NUMBER_EMOJI
                                             .get(i)
@@ -850,6 +895,22 @@ pub fn spawn(
                                             .unwrap_or("?");
                                         crate::matrix::react(&client, &room_id, &event_id, emoji)
                                             .await;
+                                    }
+                                    crate::matrix::react(
+                                        &client,
+                                        &room_id,
+                                        &event_id,
+                                        crate::matrix::DECLINE_EMOJI,
+                                    )
+                                    .await;
+                                    if p.chat_option_index().is_some() {
+                                        crate::matrix::react(
+                                            &client,
+                                            &room_id,
+                                            &event_id,
+                                            crate::matrix::CHAT_EMOJI,
+                                        )
+                                        .await;
                                     }
                                 }
                                 tracing::info!(
