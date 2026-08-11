@@ -132,6 +132,21 @@ directory, not just the bridge's own, the sidecar carries `session_id` and the b
 checks it against its own `CLAUDE_CODE_SESSION_ID` before trusting it — a foreign
 session's entry reads as if there were no pending prompt at all.
 
+**Answering beyond a plain numbered choice** — confirmed live, see
+`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section:
+
+- **❌ decline** — react with ❌ (pre-seeded alongside the numbered options) to reject the
+  prompt outright. For `AskUserQuestion` this hits the CLI's own fixed reject entry (its
+  two trailing options beyond the model's own choices behave identically — neither can
+  capture text through this tool at all); for `ExitPlanMode` it's "Tell Claude what to
+  change" with nothing typed, a plain rejection.
+- **Reply with feedback** — `ExitPlanMode` only. Reply (not just send a new message) to the
+  prompt message with your feedback text, and the bridge types it into the free-text
+  option and submits with `shift+tab` instead of `Enter` — this **approves the plan and
+  attaches your text as feedback in the same turn**, not a reject-then-retry round trip.
+  There is no equivalent for `AskUserQuestion`: its own free-text-looking options were
+  confirmed to have no text-capture path at all.
+
 | Variable | Required | Description |
 |---|---|---|
 | `CC_MATRIX_PENDING_PROMPT_PATH` | No | Overrides the sidecar path outright (default: `~/.claude/channels/matrix/pending_prompt-<session_id>.json`, namespaced per session so a second Claude Code session sharing the hook's scope can't clobber the bridge's own pending entry) — if set, must match between the hook script and the bridge process |

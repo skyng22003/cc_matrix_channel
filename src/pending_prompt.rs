@@ -125,6 +125,34 @@ impl PendingPrompt {
             PromptKind::AskUserQuestion => self.options.len(),
         }
     }
+
+    /// Which `tmux_relay` option index a ❌ decline reaction should send — confirmed live
+    /// (`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section) for both kinds, distinct
+    /// from every numbered `options[N]` entry:
+    ///
+    /// - `AskUserQuestion`: one past the last real option. The CLI always renders two more
+    ///   fixed entries after the model's own choices ("options 4 and 5" in the common
+    ///   3-option case Sky first noticed) — confirmed live that selecting *either* rejects
+    ///   the tool call identically, with no way to capture text through this path. This
+    ///   targets the first of the two (`options.len()`, i.e. digit `options.len() + 1`);
+    ///   the second is redundant to also send.
+    /// - `ExitPlanMode`: the last of the three fixed options ("Tell Claude what to change"),
+    ///   pressed with `Enter` and no typed feedback — confirmed live this is a plain
+    ///   rejection, the same outcome as `AskUserQuestion`'s fixed entries. This is
+    ///   `options.len() - 1` (index 2), already present in `options` unlike the
+    ///   `AskUserQuestion` case above.
+    ///
+    /// Only meaningful when [`answerable_by_reaction`] is true — callers gate the ❌ offer
+    /// on that flag, the same as the numbered ones, rather than guessing at an unsupported
+    /// shape's real option count.
+    ///
+    /// [`answerable_by_reaction`]: PendingPrompt::answerable_by_reaction
+    pub fn decline_option_index(&self) -> usize {
+        match self.kind {
+            PromptKind::AskUserQuestion => self.options.len(),
+            PromptKind::ExitPlanMode => self.options.len().saturating_sub(1),
+        }
+    }
 }
 
 /// A sidecar older than this is treated as stale and ignored — same posture as
@@ -505,6 +533,27 @@ mod tests {
         unsafe {
             std::env::remove_var("CC_MATRIX_PENDING_PROMPT_PATH");
         }
+    }
+
+    #[test]
+    fn ask_user_question_declines_one_past_the_last_real_option() {
+        let p = pending_of(ASK_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(p.options.len(), 3);
+        assert_eq!(
+            p.decline_option_index(),
+            3,
+            "digit 4 — the first of the two fixed reject entries"
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_declines_its_own_last_option() {
+        let p = pending_of(PLAN_SIDECAR, Some(SESSION)).unwrap();
+        assert_eq!(
+            p.decline_option_index(),
+            2,
+            "index 2 — \"Tell Claude what to change\", pressed with no typed feedback"
+        );
     }
 
     #[test]

@@ -373,7 +373,15 @@ fn render_prompt(p: &PendingPrompt) -> String {
                 body.push_str(&format!("{}. {opt} _(reply at the terminal)_\n", i + 1));
             }
         }
-        body.push_str("\nReact with a number to answer.");
+        body.push_str("\nReact with a number to answer, or ❌ to decline.");
+        if p.kind == PromptKind::ExitPlanMode {
+            // The one case a reaction can't express: approve, but with a change. Confirmed
+            // live this is a genuinely different outcome from ❌ (a plain reject followed
+            // by a fresh message costs a whole extra plan/approval round trip) — see
+            // `PendingPrompt::decline_option_index`'s doc and `MatrixBridge::handle_message`'s
+            // reply-feedback interception.
+            body.push_str("\nOr reply to *this* message to approve with feedback.");
+        }
     } else {
         // Multi-select, multiple questions, or more options than there are keycap emoji —
         // not guessable as a single reaction menu (see `PendingPrompt::unsupported_shape`).
@@ -834,15 +842,16 @@ pub fn spawn(
                                             // `reaction_option_count`'s doc). Caught in
                                             // code review.
                                             option_count: p.reaction_option_count(),
+                                            decline_option_index: p.decline_option_index(),
                                             room_id: room_id.clone(),
                                         },
                                     );
-                                    // Pre-seed the numbered reactions on our own message —
-                                    // confirmed live this matters: without an existing
-                                    // reaction to tap, answering means digging through the
-                                    // client's full emoji picker to find the right keycap
-                                    // by hand every time, instead of just tapping a pill
-                                    // that's already there.
+                                    // Pre-seed the numbered reactions, then ❌, on our own
+                                    // message — confirmed live this matters: without an
+                                    // existing reaction to tap, answering means digging
+                                    // through the client's full emoji picker to find the
+                                    // right keycap by hand every time, instead of just
+                                    // tapping a pill that's already there.
                                     for i in 0..p.reaction_option_count() {
                                         let emoji = crate::matrix::NUMBER_EMOJI
                                             .get(i)
@@ -851,6 +860,13 @@ pub fn spawn(
                                         crate::matrix::react(&client, &room_id, &event_id, emoji)
                                             .await;
                                     }
+                                    crate::matrix::react(
+                                        &client,
+                                        &room_id,
+                                        &event_id,
+                                        crate::matrix::DECLINE_EMOJI,
+                                    )
+                                    .await;
                                 }
                                 tracing::info!(
                                     room_id = %room_id,

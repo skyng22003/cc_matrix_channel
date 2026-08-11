@@ -10,10 +10,16 @@
 //! by direct observation in a disposable session, see `tools/menu-spike/FINDINGS.md`:
 //!
 //! - `AskUserQuestion`: a single digit keystroke, with no `Enter`, submits that option
-//!   immediately, from wherever the cursor happens to be.
+//!   immediately, from wherever the cursor happens to be. Its two fixed trailing options
+//!   (beyond the model's own choices) both reject the tool call identically — no text
+//!   capture is possible through this tool at all, confirmed live
+//!   (`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section).
 //! - `ExitPlanMode`: a bare digit is typed as literal text into the free-text "tell Claude
 //!   what to change" option instead of selecting anything. Needs `Up`/`Down` navigation to
-//!   the target option, then `Enter`.
+//!   the target option, then either `Enter` with nothing typed (a plain reject — the ❌
+//!   decline path) or literal feedback text followed by `shift+tab` instead of `Enter`
+//!   (confirmed live: approves the plan *and* attaches the text as feedback in the same
+//!   turn — the reply-feedback path, `MenuAnswer::feedback`).
 //!
 //! [`TmuxRelay::answer_prompt`] never guesses beyond what was directly observed — see its
 //! doc comment for the ExitPlanMode cursor-position assumption it does still make, and why.
@@ -100,6 +106,30 @@ impl TmuxRelay {
         Ok(())
     }
 
+    /// `tmux send-keys -t <pane> -l <text>` — `-l` (literal) sends `text` as raw
+    /// keystrokes with no key-name interpretation at all, unlike [`send_keys`]'s bare
+    /// arguments. Needed for feedback text specifically: it's arbitrary user-typed
+    /// content, and without `-l` a feedback message that happened to read e.g. `"Enter"`
+    /// or contain a `;` (tmux's own send-keys command separator) would not land as the
+    /// literal characters typed.
+    ///
+    /// [`send_keys`]: TmuxRelay::send_keys
+    async fn send_literal(&self, text: &str) -> anyhow::Result<()> {
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &self.pane, "-l", text])
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to run tmux send-keys -l: {e}"))?;
+        if !status.success() {
+            anyhow::bail!(
+                "tmux send-keys -l -t {} failed (status {:?})",
+                self.pane,
+                status.code()
+            );
+        }
+        Ok(())
+    }
+
     /// Send `keys`, wait [`SETTLE`], recapture, and only report success if
     /// `confirmed(before, after)` says the pane actually changed as expected.
     ///
@@ -165,14 +195,64 @@ impl TmuxRelay {
                     .await
             }
             PromptKind::ExitPlanMode => {
-                // Confirmed live: no digit shortcut, and a bare digit corrupts the
-                // free-text option instead of selecting anything (see the module doc and
-                // this method's own doc for the cursor-position caveat).
-                let mut keys: Vec<&str> =
-                    std::iter::repeat_n("Down", answer.option_index).collect();
-                keys.push("Enter");
-                self.send_and_confirm(&keys, SETTLE, |before, after| before != after)
-                    .await
+                if let Some(feedback) = &answer.feedback {
+                    // Confirmed live (`tools/menu-spike/FINDINGS.md`'s options-4/5/3
+                    // section): navigate to the free-text option, type the feedback
+                    // literally, then `shift+tab` (not `Enter`) — this approves the plan
+                    // *and* attaches the typed text as feedback in the same turn, unlike
+                    // `Enter` on that same option with no text (a plain reject, the
+                    // decline path below). Not run through `send_and_confirm` until the
+                    // final submit: an intermediate confirm on the navigation/typing steps
+                    // would have nothing meaningful to compare against (the free-text box
+                    // changing as expected isn't itself proof the *submit* will work), and
+                    // this way `before`/`after` bracket the one keystroke that actually
+                    // resolves the prompt.
+                    let nav: Vec<&str> = std::iter::repeat_n("Down", answer.option_index).collect();
+                    if !nav.is_empty() {
+                        self.send_keys(&nav).await?;
+                    }
+                    self.send_literal(feedback).await?;
+                    // Confirm the literal text actually landed in the free-text box before
+                    // submitting — confirmed live this race is real, not hypothetical: the
+                    // very first attempt at this path submitted a plain approval with *no*
+                    // feedback at all, because `shift+tab` reached the terminal before the
+                    // typed text fully had. Bounded the same way the pre-send precondition
+                    // check above is, and flattened the same way for the same reason
+                    // (`pane_shows_expected_prompt`'s doc — hard line-wrapping can split
+                    // text across lines, which would make a plain substring check fail
+                    // even when the text genuinely is there).
+                    let deadline = tokio::time::Instant::now() + PRECONDITION_TIMEOUT;
+                    loop {
+                        let pane = self.capture().await?;
+                        if flatten(&pane).contains(feedback.as_str()) {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            // Deliberately not including the pane content here — this
+                            // `anyhow::Error` reaches `main.rs`'s `tracing::error!`, and the
+                            // pane at this point may contain the plan and/or the feedback
+                            // text itself. Same posture `status.rs`'s module doc establishes
+                            // everywhere else in this codebase: never let prompt/plan content
+                            // reach the logs, error paths included.
+                            anyhow::bail!(
+                                "typed feedback text never appeared in the pane after \
+                                 {PRECONDITION_TIMEOUT:?}; refusing to submit blind"
+                            );
+                        }
+                        tokio::time::sleep(PRECONDITION_POLL).await;
+                    }
+                    self.send_and_confirm(&["BTab"], SETTLE, |before, after| before != after)
+                        .await
+                } else {
+                    // Confirmed live: no digit shortcut, and a bare digit corrupts the
+                    // free-text option instead of selecting anything (see the module doc
+                    // and this method's own doc for the cursor-position caveat).
+                    let mut keys: Vec<&str> =
+                        std::iter::repeat_n("Down", answer.option_index).collect();
+                    keys.push("Enter");
+                    self.send_and_confirm(&keys, SETTLE, |before, after| before != after)
+                        .await
+                }
             }
         }
     }
@@ -195,7 +275,7 @@ impl TmuxRelay {
 /// retries. This is exactly what happened first: `answer_prompt`'s retry loop ran out its
 /// full timeout against a pane that visibly *did* show the right prompt the whole time.
 fn pane_shows_expected_prompt(pane: &str, kind: PromptKind, expected_option_count: usize) -> bool {
-    let flat = pane.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flatten(pane);
     let numbered_options_present = (1..=expected_option_count)
         .filter(|n| flat.contains(&format!("{n}.")))
         .count();
@@ -206,6 +286,16 @@ fn pane_shows_expected_prompt(pane: &str, kind: PromptKind, expected_option_coun
         PromptKind::AskUserQuestion => flat.contains("Enter to select"),
         PromptKind::ExitPlanMode => flat.contains("Would you like to proceed?"),
     }
+}
+
+/// Whitespace-flatten pane text before any substring check against it — shared by
+/// [`pane_shows_expected_prompt`] and [`TmuxRelay::answer_prompt`]'s post-typing check.
+/// `tmux capture-pane`'s hard line-wrapping can split a target phrase across two lines,
+/// which would otherwise make a plain substring check fail forever regardless of how long a
+/// caller retries — confirmed live, see [`pane_shows_expected_prompt`]'s doc for the full
+/// story of the bug this fixes.
+fn flatten(pane: &str) -> String {
+    pane.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -275,6 +365,26 @@ mod tests {
 
         let relay = TmuxRelay::new(session);
         f(relay).await;
+    }
+
+    #[tokio::test]
+    async fn send_literal_delivers_text_verbatim_including_a_key_name_lookalike() {
+        with_test_session(|relay| async move {
+            // Deliberately includes "Enter" and a `;` — if `-l` weren't doing its job,
+            // tmux would either interpret "Enter" as the key or split the command on `;`,
+            // and neither substring would show up literally in the pane.
+            relay
+                .send_literal("please add Enter;here literally")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let pane = relay.capture().await.unwrap();
+            assert!(
+                pane.contains("please add Enter;here literally"),
+                "pane: {pane}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -700,6 +810,7 @@ mod tests {
                 kind: pending.kind,
                 option_index: 1,
                 option_count: pending.options.len(),
+                feedback: None,
             };
             let confirmed = relay
                 .answer_prompt(&answer)
@@ -758,6 +869,7 @@ mod tests {
                 kind: pending.kind,
                 option_index: 1,
                 option_count: pending.options.len(),
+                feedback: None,
             };
             let confirmed = relay
                 .answer_prompt(&answer)
@@ -771,6 +883,122 @@ mod tests {
             assert!(
                 wait_for_resolved(&sidecar, &session_id, Duration::from_secs(5)).await,
                 "the PostToolUse hook should have cleared the sidecar once answered"
+            );
+        }
+
+        /// Reads the raw transcript looking for a `message.content` array that contains
+        /// *both* a `tool_result` matching `tool_use_id` and a `text` block containing
+        /// `feedback`, as **siblings in the same array** — confirmed live this is the real
+        /// shape (not the feedback nested inside the tool_result's own `content`, which an
+        /// earlier version of this function wrongly assumed and had to be corrected against
+        /// the actual transcript record). The proof this whole reply-feedback tier exists
+        /// for: not just that the pane changed (a plain reject changes the pane too), but
+        /// that the specific text landed as part of the *approval* itself, in the same
+        /// turn.
+        async fn transcript_shows_feedback_attached(
+            project_dir: &Path,
+            session_id: &str,
+            tool_use_id: &str,
+            feedback: &str,
+            timeout: Duration,
+        ) -> bool {
+            let path = project_dir.join(format!("{session_id}.jsonl"));
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                    for line in text.lines() {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                            continue;
+                        };
+                        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array())
+                        else {
+                            continue;
+                        };
+                        let has_matching_tool_result = blocks.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                                && b.get("tool_use_id").and_then(|t| t.as_str())
+                                    == Some(tool_use_id)
+                        });
+                        let has_feedback_text = blocks.iter().any(|b| {
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|t| t.contains(feedback))
+                        });
+                        if has_matching_tool_result && has_feedback_text {
+                            return true;
+                        }
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "spawns a real disposable Claude Code session; needs `claude` + `tmux` + `jq`, real API usage"]
+        async fn answer_prompt_approves_with_feedback_in_a_real_exit_plan_mode() {
+            let Some((relay, project_dir, sidecar, _guard)) =
+                spawn_disposable_claude_session().await
+            else {
+                return;
+            };
+
+            relay
+                .send_keys(&[
+                    "Switch into plan mode and make a trivial 2-step plan for renaming a \
+                     variable in a nonexistent file called foo.txt, then present the plan \
+                     for approval.",
+                ])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            relay.send_keys(&["Enter"]).await.unwrap();
+
+            let session_id = wait_for_session_id(&project_dir, Duration::from_secs(15))
+                .await
+                .expect("a transcript should appear for the disposable session");
+            let pending = wait_for_pending_prompt(&sidecar, &session_id, Duration::from_secs(60))
+                .await
+                .expect(
+                    "the PreToolUse hook should have written the sidecar while the plan \
+                     approval is still pending",
+                );
+            assert_eq!(pending.kind, PromptKind::ExitPlanMode);
+
+            const FEEDBACK: &str = "please add a comment at the top of the file";
+            let answer = MenuAnswer {
+                tool_use_id: pending.tool_use_id.clone(),
+                kind: pending.kind,
+                option_index: pending.decline_option_index(),
+                option_count: pending.options.len(),
+                feedback: Some(FEEDBACK.to_string()),
+            };
+            let confirmed = relay
+                .answer_prompt(&answer)
+                .await
+                .expect("answer_prompt should not error");
+            assert!(
+                confirmed,
+                "answer_prompt should confirm the shift+tab submit landed"
+            );
+
+            assert!(
+                wait_for_resolved(&sidecar, &session_id, Duration::from_secs(5)).await,
+                "the PostToolUse hook should have cleared the sidecar once approved"
+            );
+            assert!(
+                transcript_shows_feedback_attached(
+                    &project_dir,
+                    &session_id,
+                    &pending.tool_use_id,
+                    FEEDBACK,
+                    Duration::from_secs(10),
+                )
+                .await,
+                "the plan's tool_result should carry the typed feedback text, proving this \
+                 approved rather than just dismissed the prompt"
             );
         }
     }
