@@ -135,8 +135,10 @@ pub(crate) const DECLINE_EMOJI: &str = "❌";
 /// Reaction that declines an `AskUserQuestion` prompt but asks Claude to clarify instead of
 /// stopping silently — see `PendingPrompt::chat_option_index` for what it actually sends.
 /// Never offered for `ExitPlanMode` (that method returns `None` for it), so this can never
-/// collide with `DECLINE_EMOJI`'s meaning there.
-pub(crate) const CHAT_EMOJI: &str = "💬";
+/// collide with `DECLINE_EMOJI`'s meaning there. A question mark rather than a speech
+/// bubble — Sky's call, matches what the reaction actually does (asks a clarifying
+/// question) better than a generic "chat" icon.
+pub(crate) const CHAT_EMOJI: &str = "❓";
 
 /// A menu prompt currently open in the room, waiting for a reaction answer.
 ///
@@ -156,7 +158,7 @@ pub struct PendingAnswer {
     pub decline_option_index: usize,
     /// Carried straight from `PendingPrompt::chat_option_index` at post time, same
     /// reasoning as `decline_option_index`. `None` for `ExitPlanMode`, which has no
-    /// equivalent option — `reaction_claims_answer` treats 💬 as not offered at all in
+    /// equivalent option — `reaction_claims_answer` treats ❓ as not offered at all in
     /// that case, the same as any other emoji this prompt doesn't recognize.
     pub chat_option_index: Option<usize>,
     pub room_id: OwnedRoomId,
