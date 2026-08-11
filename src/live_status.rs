@@ -361,17 +361,14 @@ fn render_prompt(p: &PendingPrompt) -> String {
     body.push('\n');
     if p.answerable_by_reaction() {
         // `reaction_option_count()` may be fewer than `options.len()` — currently only for
-        // `ExitPlanMode`'s trailing free-text option (see its doc). Those get plain numbers
-        // instead of a reaction emoji: they're shown for visibility, but reacting to one
-        // wouldn't actually be honored (`matrix.rs`'s `OptionOutOfRange` check refuses it).
+        // `ExitPlanMode`'s trailing free-text option (see its doc). That one isn't listed
+        // here at all: the "approve/answer with feedback via Reply" line below already says
+        // how to do the same thing, so spelling it out again as an unreachable-by-reaction
+        // "3." would just be repeating the footer (Sky's call).
         let reaction_count = p.reaction_option_count();
-        for (i, opt) in p.options.iter().enumerate() {
-            if i < reaction_count {
-                let emoji = crate::matrix::NUMBER_EMOJI.get(i).copied().unwrap_or("?");
-                body.push_str(&format!("{emoji} {opt}\n"));
-            } else {
-                body.push_str(&format!("{}. {opt} _(reply at the terminal)_\n", i + 1));
-            }
+        for (i, opt) in p.options.iter().take(reaction_count).enumerate() {
+            let emoji = crate::matrix::NUMBER_EMOJI.get(i).copied().unwrap_or("?");
+            body.push_str(&format!("{emoji} {opt}\n"));
         }
         body.push_str("\nReact with a number to answer, or ❌ to decline.");
         match p.kind {
@@ -398,7 +395,7 @@ fn render_prompt(p: &PendingPrompt) -> String {
             PromptKind::AskUserQuestion => {
                 body.push_str(
                     "\nOr use your client's Reply feature on *this* message (not a plain \
-                     new message) with your own answer, or 💬 to decline and have Claude \
+                     new message) with your own answer, or ❓ to decline and have Claude \
                      ask what you meant.",
                 );
             }
@@ -881,7 +878,7 @@ pub fn spawn(
                                             room_id: room_id.clone(),
                                         },
                                     );
-                                    // Pre-seed the numbered reactions, then ❌ (and 💬 when
+                                    // Pre-seed the numbered reactions, then ❌ (and ❓ when
                                     // this prompt has one), on our own message — confirmed
                                     // live this matters: without an existing reaction to
                                     // tap, answering means digging through the client's
@@ -1541,10 +1538,15 @@ mod tests {
         assert!(body.contains("# Demo Plan"));
         assert!(body.contains("1️⃣ Yes, and use auto mode"));
         assert!(body.contains("2️⃣ Yes, manually approve edits"));
-        // The free-text third option is shown for visibility but not offered as a
-        // reaction target — see `reaction_option_count`'s doc (caught in code review:
-        // nothing had confirmed live what reacting to it would actually do).
-        assert!(body.contains("3. Tell Claude what to change"));
+        // The free-text third option isn't listed at all — not offered as a reaction
+        // target (see `reaction_option_count`'s doc), and the "approve with feedback via
+        // Reply" footer already says how to do the same thing, so spelling it out again
+        // as an unreachable "3." would just repeat that (Sky's call, 2026-08-11).
+        assert!(
+            !body.contains("Tell Claude what to change"),
+            "the free-text option is covered by the Reply-with-feedback footer, not \
+             listed again: {body}"
+        );
         assert!(
             !body.contains("3️⃣"),
             "the free-text option must not get a reaction emoji: {body}"

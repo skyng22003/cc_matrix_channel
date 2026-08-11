@@ -148,7 +148,7 @@ session's entry reads as if there were no pending prompt at all.
     attaches your text as feedback in the same turn**, not a reject-then-retry round trip.
   - `AskUserQuestion`: submits with plain `Enter` — **your text becomes Claude's actual
     answer** to the question, the same as picking a real option.
-- **💬 "chat about this"** — `AskUserQuestion` only (pre-seeded alongside ❌ there, not
+- **❓ "chat about this"** — `AskUserQuestion` only (pre-seeded alongside ❌ there, not
   offered on `ExitPlanMode` prompts). Also declines, but Claude auto-continues with a
   clarifying question instead of stopping silently — the difference from ❌: you don't have
   to know to follow up, Claude asks first.
