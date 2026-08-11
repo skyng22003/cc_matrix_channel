@@ -352,6 +352,48 @@ enum Record {
     AssistantText,
     /// A human prompt: the start of a turn.
     UserPrompt,
+    /// Claude Code's own synthetic interrupt marker — the turn ended *right here*, not a
+    /// new one starting. See [`is_interrupt_notice`]'s doc for how this was found and why
+    /// it needs its own variant rather than falling in with [`Record::UserPrompt`].
+    Interrupted,
+}
+
+/// True for Claude Code's own synthetic "this turn was cut short" marker — confirmed live,
+/// two variants seen in real transcripts: `"[Request interrupted by user for tool use]"`
+/// (an interactive tool, e.g. `AskUserQuestion`/`ExitPlanMode`, declined or rejected) and
+/// `"[Request interrupted by user]"` (a plain Escape mid-generation, no tool involved).
+/// Both are a `user`-type record whose `message.content` is a *single* `text` block with
+/// this prefix — unlike a genuine human prompt, which is always a plain string (confirmed
+/// against real Matrix-forwarded and terminal-typed records, never an array), this is
+/// distinguishable structurally, not just by content, which is why the check below shapes
+/// as it does.
+///
+/// **Why this needed its own variant, found live**: without it, this record has no
+/// top-level `toolUseResult` field (the tool call it interrupted does, one line earlier —
+/// only *this* line doesn't), so it fell through to `Record::UserPrompt` — treated as if a
+/// fresh human turn had just started. `UserPrompt` maps unconditionally to `Working`, with
+/// no age-based path to `WaitingForUser` the way `AssistantText` has, so a declined
+/// interactive prompt with nothing further to say could only ever escape via the full
+/// [`DEFAULT_STALL_SECS`] stall timer — genuinely reaching `Stalled` and posting an alert,
+/// eventually, but never the clean "waiting for you" edit a turn that legitimately just
+/// ended deserves. Caught live testing the reaction-answering feature: a real decline sat
+/// reading "Claude is working… 5m 0s" for the full five minutes before self-correcting.
+fn is_interrupt_notice(v: &serde_json::Value) -> bool {
+    let Some(blocks) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    let [only] = blocks.as_slice() else {
+        return false;
+    };
+    only.get("type").and_then(|t| t.as_str()) == Some("text")
+        && only
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.starts_with("[Request interrupted by user"))
 }
 
 fn classify(v: &serde_json::Value) -> Option<Record> {
@@ -374,6 +416,8 @@ fn classify(v: &serde_json::Value) -> Option<Record> {
         "user" => {
             if v.get("toolUseResult").is_some() {
                 Some(Record::ToolResult)
+            } else if is_interrupt_notice(v) {
+                Some(Record::Interrupted)
             } else {
                 Some(Record::UserPrompt)
             }
@@ -466,6 +510,9 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
             _ => (AgentState::WaitingForUser, false),
         },
         Record::UserPrompt => (AgentState::Working, false),
+        // No grace, no stall wait — this marker is unambiguous by construction (see
+        // `is_interrupt_notice`'s doc): the turn is already over, not merely quiet.
+        Record::Interrupted => (AgentState::WaitingForUser, false),
     };
 
     // Stalling only applies to states that claim work is in progress. An agent that
@@ -551,6 +598,17 @@ mod tests {
     const REPLY_TOOL_USE: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:09.000Z","message":{"content":[{"type":"tool_use","name":"mcp__matrix__reply","input":{"text":"secret reply body"}}]}}"#;
     const REPLY_TOOL_RESULT: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:11.000Z","toolUseResult":{"stdout":"ok"},"message":{"content":[{"type":"tool_result"}]}}"#;
 
+    // Real captured shapes (2026-08-11, `-workspace` project transcript) of an interactive
+    // tool (AskUserQuestion) declined via the bridge's own ❌ decline reaction — the actual
+    // sequence that surfaced this bug live. `ASKUSERQUESTION_REJECTED` has a `toolUseResult`
+    // (correctly classifies as `Record::ToolResult`); `INTERRUPT_NOTICE`, one millisecond
+    // later, does not, and is what fell through to `Record::UserPrompt` before this fix.
+    const ASKUSERQUESTION_TOOL_USE: &str = r#"{"type":"assistant","timestamp":"2026-08-08T12:00:05.000Z","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{}}]}}"#;
+    const ASKUSERQUESTION_REJECTED: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:07.000Z","toolUseResult":"User rejected tool use","toolDenialKind":"user-rejected","message":{"content":[{"type":"tool_result","content":"The user doesn't want to proceed with this tool use.","is_error":true,"tool_use_id":"toolu_x"}]}}"#;
+    const INTERRUPT_NOTICE: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:07.100Z","message":{"content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}"#;
+    // The other confirmed variant, no tool call involved — a plain Escape mid-generation.
+    const INTERRUPT_NOTICE_PLAIN: &str = r#"{"type":"user","timestamp":"2026-08-08T12:00:07.100Z","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#;
+
     #[test]
     fn timestamp_parsing_matches_known_epoch() {
         // Expected values cross-checked against `date -u -d <ts> +%s`.
@@ -616,6 +674,52 @@ mod tests {
         let s = status_of(&[PROMPT, TOOL_USE], "2026-08-08T12:10:00.000Z");
         assert_eq!(s.state, AgentState::Stalled);
         assert_eq!(s.last_tool.as_deref(), Some("Bash"));
+    }
+
+    /// The bug, reproduced from the real captured shapes: without recognizing Claude
+    /// Code's own interrupt marker, this tail read as `Record::UserPrompt` (a fresh turn
+    /// just started) and could only ever reach `WaitingForUser` via the full stall timer —
+    /// even checked *immediately* after the decline, with no time elapsed at all.
+    #[test]
+    fn a_declined_interactive_tool_reads_as_waiting_for_you_immediately() {
+        let s = status_of(
+            &[
+                PROMPT,
+                ASKUSERQUESTION_TOOL_USE,
+                ASKUSERQUESTION_REJECTED,
+                INTERRUPT_NOTICE,
+            ],
+            "2026-08-08T12:00:07.500Z", // 400ms later — nowhere near any stall or grace window
+        );
+        assert_eq!(s.state, AgentState::WaitingForUser);
+        assert_eq!(s.turn_elapsed, None);
+        assert_eq!(s.last_tool, None);
+    }
+
+    /// The other confirmed variant — a plain Escape mid-generation, no tool call involved
+    /// at all (so no preceding `toolUseResult` line either). Same fix, same immediacy.
+    #[test]
+    fn a_plain_interrupt_with_no_tool_call_also_reads_as_waiting_for_you_immediately() {
+        let s = status_of(
+            &[PROMPT, TOOL_USE, INTERRUPT_NOTICE_PLAIN],
+            "2026-08-08T12:00:07.500Z",
+        );
+        assert_eq!(s.state, AgentState::WaitingForUser);
+    }
+
+    /// The disambiguation this whole fix depends on: a genuine short human prompt — same
+    /// structural shape (a single `text` content block, no `toolUseResult`) but different
+    /// text — must not be mistaken for the interrupt marker. `PROMPT` itself already
+    /// exercises this implicitly (every test above it passes), but this pins the specific
+    /// property directly rather than leaving it to be true by side effect.
+    #[test]
+    fn a_short_prompt_that_merely_resembles_the_shape_is_not_mistaken_for_an_interrupt() {
+        let s = status_of(&[PROMPT], "2026-08-08T12:00:01.000Z");
+        assert_eq!(
+            s.state,
+            AgentState::Working,
+            "a genuine new prompt must still read as Working, not WaitingForUser"
+        );
     }
 
     /// A finished turn left alone for hours is waiting, not stalled.
