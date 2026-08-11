@@ -4,16 +4,18 @@ mod fallback_reply;
 mod live_status;
 mod matrix;
 mod mcp;
+mod pending_prompt;
 mod rooms;
 mod status;
+mod tmux_relay;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use matrix_sdk::ruma::OwnedRoomId;
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use rmcp::{ServiceExt, transport::stdio};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +24,10 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::access::AccessControl;
 use crate::config::Config;
-use crate::matrix::{ChannelNotification, MatrixBridge, MatrixBridgeConfig, PermissionVerdict};
+use crate::matrix::{
+    ChannelNotification, MatrixBridge, MatrixBridgeConfig, MenuAnswer, PendingAnswer,
+    PermissionVerdict,
+};
 use crate::mcp::{MatrixChannelServer, McpServerConfig};
 
 #[tokio::main]
@@ -164,6 +169,13 @@ async fn main() -> Result<()> {
         Arc::new(parking_lot::Mutex::new(restored_last_active));
     let pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>> =
         Arc::new(parking_lot::Mutex::new(HashSet::new()));
+    // Menu prompts (AskUserQuestion/ExitPlanMode) currently posted to Matrix, awaiting a
+    // reaction answer — populated by live_status.rs, consumed (single-shot) by
+    // matrix.rs's reaction handler. Same three-way fan-out shape as pending_permissions/
+    // permission_verdict_tx above.
+    let pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>> =
+        Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let (menu_answer_tx, mut menu_answer_rx) = mpsc::channel::<MenuAnswer>(16);
 
     // Initialize Matrix bridge if credentials are available; otherwise setup mode
     let matrix_bridge = if config.has_credentials() {
@@ -176,6 +188,8 @@ async fn main() -> Result<()> {
                 known_rooms: known_rooms.clone(),
                 last_active_room: last_active_room.clone(),
                 pending_permissions: pending_permissions.clone(),
+                pending_answers: pending_answers.clone(),
+                menu_answer_tx: menu_answer_tx.clone(),
                 cancel: cancel.clone(),
             },
         )
@@ -196,8 +210,53 @@ async fn main() -> Result<()> {
             known_rooms.clone(),
             last_active_room.clone(),
             access_control.clone(),
+            pending_answers.clone(),
             cancel.clone(),
         );
+    }
+
+    // tmux keystroke relay for menu answers. Detecting and posting pending prompts (above)
+    // always runs; actually touching the terminal is gated behind
+    // `tmux_answers_enabled`, off by default — see Config::tmux_answers_enabled.
+    {
+        let tmux_pane = config.tmux_pane.clone();
+        let tmux_answers_enabled = config.tmux_answers_enabled;
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let relay = tmux_relay::TmuxRelay::new(tmux_pane);
+            loop {
+                let answer = tokio::select! {
+                    a = menu_answer_rx.recv() => match a {
+                        Some(a) => a,
+                        None => break,
+                    },
+                    _ = cancel.cancelled() => break,
+                };
+                if !tmux_answers_enabled {
+                    tracing::warn!(
+                        tool_use_id = %answer.tool_use_id,
+                        option_index = answer.option_index,
+                        "Menu answer received but CC_MATRIX_TMUX_ANSWERS_ENABLED is false; \
+                         visibility-only, dropping keystroke"
+                    );
+                    continue;
+                }
+                match relay.answer_prompt(&answer).await {
+                    Ok(true) => tracing::info!(
+                        tool_use_id = %answer.tool_use_id,
+                        "Menu answered via tmux, confirmed"
+                    ),
+                    Ok(false) => tracing::error!(
+                        tool_use_id = %answer.tool_use_id,
+                        "Could not confirm the keystroke landed — pane left alone, needs manual tmux attach"
+                    ),
+                    Err(e) => tracing::error!(
+                        tool_use_id = %answer.tool_use_id,
+                        "tmux relay failed: {e}"
+                    ),
+                }
+            }
+        });
     }
 
     // MCP server — handles both setup and full mode
@@ -207,6 +266,8 @@ async fn main() -> Result<()> {
         known_rooms,
         last_active_room,
         pending_permissions,
+        pending_answers: pending_answers.clone(),
+        menu_answer_tx: menu_answer_tx.clone(),
         notification_tx,
         notification_rx,
         permission_verdict_tx,

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,6 +107,9 @@ pub struct McpServerConfig {
     pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     pub last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub pending_answers:
+        Arc<parking_lot::Mutex<HashMap<OwnedEventId, crate::matrix::PendingAnswer>>>,
+    pub menu_answer_tx: mpsc::Sender<crate::matrix::MenuAnswer>,
     pub notification_tx: mpsc::Sender<ChannelNotification>,
     pub notification_rx: mpsc::Receiver<ChannelNotification>,
     pub permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
@@ -125,6 +128,8 @@ pub struct MatrixChannelServer {
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, crate::matrix::PendingAnswer>>>,
+    menu_answer_tx: mpsc::Sender<crate::matrix::MenuAnswer>,
     notification_tx: mpsc::Sender<ChannelNotification>,
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
     permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
@@ -147,6 +152,8 @@ impl MatrixChannelServer {
             known_rooms: config.known_rooms,
             last_active_room: config.last_active_room,
             pending_permissions: config.pending_permissions,
+            pending_answers: config.pending_answers,
+            menu_answer_tx: config.menu_answer_tx,
             notification_tx: config.notification_tx,
             notification_rx: Arc::new(Mutex::new(Some(config.notification_rx))),
             permission_verdict_tx: config.permission_verdict_tx,
@@ -1115,6 +1122,8 @@ impl MatrixChannelServer {
                 known_rooms: self.known_rooms.clone(),
                 last_active_room: self.last_active_room.clone(),
                 pending_permissions: self.pending_permissions.clone(),
+                pending_answers: self.pending_answers.clone(),
+                menu_answer_tx: self.menu_answer_tx.clone(),
                 cancel: self.cancel.clone(),
             },
         )
@@ -1133,6 +1142,7 @@ impl MatrixChannelServer {
             self.known_rooms.clone(),
             self.last_active_room.clone(),
             self.access_control.clone(),
+            self.pending_answers.clone(),
             self.cancel.clone(),
         );
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,9 +9,11 @@ use matrix_sdk::{
     Client, LoopCtrl, Room,
     config::{RequestConfig, SyncSettings},
     ruma::{
-        OwnedDeviceId, OwnedRoomId, OwnedUserId,
+        OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId,
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+            reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+            relation::Annotation,
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
@@ -108,6 +110,101 @@ pub fn parse_permission_verdict(text: &str) -> Option<PermissionVerdict> {
     })
 }
 
+/// Reaction keycap emoji used to answer a pending prompt by index — `1️⃣` selects option 0,
+/// `2️⃣` option 1, and so on. Length matches `crate::pending_prompt::MAX_REACTION_OPTIONS`,
+/// which is what bounds how many options a prompt can offer before it stops being
+/// reaction-answerable in the first place.
+pub(crate) const NUMBER_EMOJI: [&str; crate::pending_prompt::MAX_REACTION_OPTIONS] =
+    ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
+
+/// Map a reaction's emoji key to a zero-based option index. `None` for anything that isn't
+/// one of the nine numbered keycaps — including the bridge's own outbound ✅/❌ ack
+/// reactions, which must never be mistaken for an answer.
+pub(crate) fn emoji_to_option_index(key: &str) -> Option<usize> {
+    NUMBER_EMOJI.iter().position(|e| *e == key)
+}
+
+/// A menu prompt currently open in the room, waiting for a reaction answer.
+///
+/// Lives here rather than in `pending_prompt` because it's Matrix-side bookkeeping (an
+/// event id and which room it's in), not transcript-derived fact — the same split
+/// `PermissionVerdict`/`pending_permissions` already draws between "what Claude Code asked"
+/// and "what the bridge is tracking about it."
+#[derive(Debug, Clone)]
+pub struct PendingAnswer {
+    pub tool_use_id: String,
+    pub kind: crate::pending_prompt::PromptKind,
+    pub option_count: usize,
+    pub room_id: OwnedRoomId,
+}
+
+/// A resolved answer to relay into the tmux pane, produced by [`MatrixBridge::handle_reaction`]
+/// and consumed by the tmux-relay task in `main.rs`.
+#[derive(Debug, Clone)]
+pub struct MenuAnswer {
+    pub tool_use_id: String,
+    pub kind: crate::pending_prompt::PromptKind,
+    pub option_index: usize,
+    /// Carried straight from the [`PendingAnswer`] this claimed, so the tmux relay's
+    /// pre-send pane-shape check has the real validated count to check against — not just
+    /// a lower bound inferred from which index was picked.
+    pub option_count: usize,
+}
+
+/// Why a reaction did not claim a [`PendingAnswer`] — see [`reaction_claims_answer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactionRejection {
+    /// The reaction's own room doesn't match the room the prompt was posted in — see
+    /// [`reaction_claims_answer`]'s doc for why this matters. The one case
+    /// `MatrixBridge::handle_reaction` logs, since it's a genuine mismatch worth knowing
+    /// about rather than ordinary noise.
+    WrongRoom,
+    /// `AccessControl::check_sender` rejected the sender.
+    AccessDenied,
+    /// The reaction's emoji isn't one of the nine numbered keycaps.
+    NotANumberedReaction,
+    /// A numbered keycap, but past `answer.option_count` (e.g. reacting 4️⃣ on a 3-option
+    /// prompt, or on `ExitPlanMode`'s free-text option once excluded from
+    /// `option_count` — see `PendingPrompt::reaction_option_count`).
+    OptionOutOfRange,
+}
+
+/// Pure decision: does this reaction claim `answer`? Kept separate from the async
+/// Matrix/access-control calls so the security-relevant logic (room match, access result,
+/// emoji mapping, bounds check) is unit-testable without a homeserver — the same split
+/// `live_status::menu_action` already uses elsewhere in this codebase.
+///
+/// `access_ok` is passed in already-evaluated rather than computed here:
+/// `AccessControl::check_sender` needs a live `&AccessControl` and Matrix sender/room
+/// types this function has no business depending on, the same reason `menu_action` takes
+/// plain `&str` ids rather than owned Matrix types.
+///
+/// The room check exists because `pending_answers` is keyed by Matrix event id alone,
+/// which is globally unique — but a reaction event only carries the id it relates to, not
+/// which room *that* event lives in. Without it, a member of a *different* room the
+/// bridge talks to could react to a copy of the same event id (relayed, quoted, or simply
+/// guessed) and have it treated as an answer to a prompt posted somewhere else entirely.
+/// Caught in code review as a real gap, not a hypothetical.
+fn reaction_claims_answer(
+    reaction_room: &OwnedRoomId,
+    answer: &PendingAnswer,
+    access_ok: bool,
+    emoji: &str,
+) -> Result<usize, ReactionRejection> {
+    if reaction_room != &answer.room_id {
+        return Err(ReactionRejection::WrongRoom);
+    }
+    if !access_ok {
+        return Err(ReactionRejection::AccessDenied);
+    }
+    let option_index =
+        emoji_to_option_index(emoji).ok_or(ReactionRejection::NotANumberedReaction)?;
+    if option_index >= answer.option_count {
+        return Err(ReactionRejection::OptionOutOfRange);
+    }
+    Ok(option_index)
+}
+
 /// A notification from Matrix to be forwarded to Claude Code via MCP.
 #[derive(Debug, Clone)]
 pub struct ChannelNotification {
@@ -129,6 +226,12 @@ pub struct MatrixBridgeConfig {
     /// Room that most recently passed the access check — where live status is posted.
     pub last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// Menu prompts currently open in the room, keyed by the Matrix event id of the
+    /// message showing them — populated by `live_status.rs` when it posts one, consumed
+    /// (single-shot, remove-on-claim) by [`MatrixBridge::handle_reaction`].
+    pub pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>>,
+    /// Where a claimed reaction answer goes to be relayed into the tmux pane.
+    pub menu_answer_tx: mpsc::Sender<MenuAnswer>,
     pub cancel: CancellationToken,
 }
 
@@ -138,6 +241,13 @@ struct MessageHandlerCtx {
     tx: mpsc::Sender<ChannelNotification>,
     permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>>,
+    menu_answer_tx: mpsc::Sender<MenuAnswer>,
+    /// Mirrors `Config::tmux_answers_enabled`. `handle_reaction`'s ack reaction reads this
+    /// to avoid a ✅ that lies: with the kill switch off (the default), a claimed reaction
+    /// is enqueued but never actually applied to the terminal — acking success anyway would
+    /// look identical, from the room, to a real answer landing. Caught in code review.
+    tmux_answers_enabled: bool,
     access: Arc<AccessControl>,
     own_user_id: OwnedUserId,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
@@ -164,6 +274,13 @@ pub struct MatrixBridge {
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>>,
+    menu_answer_tx: mpsc::Sender<MenuAnswer>,
+    /// Read from `Config` (not `MatrixBridgeConfig` — no shared-state plumbing needed,
+    /// `Config` is already a direct parameter here) and threaded into
+    /// `MessageHandlerCtx` so `handle_reaction` knows whether an ack it's about to send
+    /// would actually be true. See `MessageHandlerCtx::tmux_answers_enabled`'s doc.
+    tmux_answers_enabled: bool,
     start_time: Instant,
     cancel: CancellationToken,
 }
@@ -177,8 +294,11 @@ impl MatrixBridge {
             known_rooms,
             last_active_room,
             pending_permissions,
+            pending_answers,
+            menu_answer_tx,
             cancel,
         } = bridge_config;
+        let tmux_answers_enabled = config.tmux_answers_enabled;
         tokio::fs::create_dir_all(&config.store_path).await?;
 
         let homeserver_url = config
@@ -334,6 +454,9 @@ impl MatrixBridge {
             permission_verdict_tx,
             access_control,
             pending_permissions,
+            pending_answers,
+            menu_answer_tx,
+            tmux_answers_enabled,
             known_rooms,
             last_active_room,
             start_time: Instant::now(),
@@ -352,6 +475,9 @@ impl MatrixBridge {
             tx: self.notification_tx.clone(),
             permission_verdict_tx: self.permission_verdict_tx.clone(),
             pending_permissions: self.pending_permissions.clone(),
+            pending_answers: self.pending_answers.clone(),
+            menu_answer_tx: self.menu_answer_tx.clone(),
+            tmux_answers_enabled: self.tmux_answers_enabled,
             access: self.access_control.clone(),
             own_user_id: self.own_user_id.clone(),
             known_rooms: self.known_rooms.clone(),
@@ -374,7 +500,14 @@ impl MatrixBridge {
                                 Self::handle_message(original.clone(), room, ctx).await;
                             }
                         }
-                        Ok(_) => {} // non-message timeline events
+                        Ok(AnySyncTimelineEvent::MessageLike(
+                            AnySyncMessageLikeEvent::Reaction(reaction),
+                        )) => {
+                            if let Some(original) = reaction.as_original() {
+                                Self::handle_reaction(original.clone(), room, ctx).await;
+                            }
+                        }
+                        Ok(_) => {} // other timeline events
                         Err(e) => {
                             tracing::debug!("Timeline event deserialization skipped: {e}");
                         }
@@ -516,6 +649,10 @@ impl MatrixBridge {
             known_rooms,
             last_active_room,
             start_time,
+            // Reaction-answer bookkeeping is `handle_reaction`'s concern, not this one's.
+            pending_answers: _,
+            menu_answer_tx: _,
+            tmux_answers_enabled: _,
         } = ctx;
 
         if event.sender == own_user_id {
@@ -804,6 +941,94 @@ impl MatrixBridge {
         }
     }
 
+    /// Answer a pending menu prompt by reaction — the counterpart to `handle_message`'s
+    /// permission-verdict interception, but for `AskUserQuestion`/`ExitPlanMode` instead of
+    /// tool-permission prompts.
+    ///
+    /// Gated by the same [`AccessControl::check_sender`] every ordinary message goes
+    /// through (confirmed as the intended v1 posture, not a placeholder — see the plan's
+    /// "Access control" section). Single-shot: [`Arc<Mutex<HashMap>>::remove`] on claim, the
+    /// same idiom `pending_permissions` already uses, so a second reaction (or two people
+    /// reacting near-simultaneously) can't both claim the same prompt.
+    async fn handle_reaction(event: OriginalSyncReactionEvent, room: Room, ctx: MessageHandlerCtx) {
+        if event.sender == ctx.own_user_id {
+            // Our own ack (✅/👀) and permission-verdict (✅/❌) reactions land here too —
+            // never mistake our own bookkeeping for an answer.
+            return;
+        }
+
+        let target = event.content.relates_to.event_id.clone();
+
+        // Look, don't yet claim: still need to check the room, the sender, and the emoji
+        // before this reaction is allowed to consume the prompt.
+        let Some(answer) = ctx.pending_answers.lock().get(&target).cloned() else {
+            return; // not reacting to a message we're tracking as a pending prompt
+        };
+
+        let current_room_id = room.room_id().to_owned();
+        let access_ok = ctx
+            .access
+            .check_sender(&event.sender, &current_room_id)
+            .is_ok();
+
+        let option_index = match reaction_claims_answer(
+            &current_room_id,
+            &answer,
+            access_ok,
+            &event.content.relates_to.key,
+        ) {
+            Ok(i) => i,
+            Err(ReactionRejection::WrongRoom) => {
+                tracing::warn!(
+                    event_id = %target,
+                    reaction_room = %current_room_id,
+                    prompt_room = %answer.room_id,
+                    "Reaction targets a pending prompt from a different room; ignoring"
+                );
+                return;
+            }
+            // Access denied, not a numbered keycap, or out of range — none warrant a log
+            // line; these are ordinary noise (someone reacting with an unrelated emoji,
+            // or a sender who just isn't paired), not the cross-room case above.
+            Err(_) => return,
+        };
+
+        // Single-shot claim: only the reaction that actually removes the entry proceeds.
+        if ctx.pending_answers.lock().remove(&target).is_none() {
+            return;
+        }
+
+        tracing::info!(
+            tool_use_id = %answer.tool_use_id,
+            option_index,
+            "Menu answer claimed via reaction"
+        );
+
+        let menu_answer = MenuAnswer {
+            tool_use_id: answer.tool_use_id,
+            kind: answer.kind,
+            option_index,
+            option_count: answer.option_count,
+        };
+        if ctx.menu_answer_tx.send(menu_answer).await.is_err() {
+            tracing::error!("Menu-answer relay task is gone; answer claimed but not delivered");
+        }
+
+        // Ack reflects what will actually happen, not just "received" — caught in code
+        // review: acking ✅ unconditionally, with the tmux kill switch off by default,
+        // would tell the room "done" on every single reaction out of the box, while the
+        // terminal stayed genuinely blocked. 👀 ("seen but not applied") when the switch
+        // is off; ✅ only when an answer might actually reach the terminal.
+        let emoji = if ctx.tmux_answers_enabled {
+            "✅"
+        } else {
+            "👀"
+        };
+        let annotation = Annotation::new(target, emoji.to_string());
+        let reaction = ReactionEventContent::new(annotation);
+        spawn_room_send("menu-answer ack", room, reaction);
+    }
+
     async fn handle_bot_command(
         text: &str,
         room: &Room,
@@ -972,4 +1197,93 @@ fn humanize_timestamp(time: std::time::SystemTime) -> String {
     let d = remaining + 1;
 
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_keycap_emoji_maps_to_its_zero_based_index() {
+        for (i, emoji) in NUMBER_EMOJI.iter().enumerate() {
+            assert_eq!(emoji_to_option_index(emoji), Some(i), "emoji: {emoji}");
+        }
+    }
+
+    /// The bridge's own ack/verdict reactions (and anything else) must never be mistaken
+    /// for a numbered answer.
+    #[test]
+    fn unrelated_emoji_is_not_an_option_index() {
+        for emoji in ["✅", "❌", "👍", "🎉", ""] {
+            assert_eq!(emoji_to_option_index(emoji), None, "emoji: {emoji}");
+        }
+    }
+
+    // --- reaction_claims_answer ---
+
+    fn room(id: &str) -> OwnedRoomId {
+        OwnedRoomId::try_from(id).unwrap()
+    }
+
+    fn answer_in(room_id: &str, option_count: usize) -> PendingAnswer {
+        PendingAnswer {
+            tool_use_id: "toolu_test".to_string(),
+            kind: crate::pending_prompt::PromptKind::AskUserQuestion,
+            option_count,
+            room_id: room(room_id),
+        }
+    }
+
+    #[test]
+    fn same_room_valid_emoji_in_range_claims_the_answer() {
+        let a = answer_in("!room:example.com", 3);
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, "2️⃣"),
+            Ok(1)
+        );
+    }
+
+    /// The core security property this whole function exists for: a reaction from a
+    /// *different* room than where the prompt was posted must never claim it, even with
+    /// a valid emoji and a sender who'd otherwise pass access control.
+    #[test]
+    fn different_room_is_rejected_even_with_a_valid_emoji_and_access() {
+        let a = answer_in("!room-a:example.com", 3);
+        assert_eq!(
+            reaction_claims_answer(&room("!room-b:example.com"), &a, true, "1️⃣"),
+            Err(ReactionRejection::WrongRoom)
+        );
+    }
+
+    #[test]
+    fn access_denied_is_rejected_even_in_the_right_room() {
+        let a = answer_in("!room:example.com", 3);
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, false, "1️⃣"),
+            Err(ReactionRejection::AccessDenied)
+        );
+    }
+
+    #[test]
+    fn unrelated_emoji_is_rejected() {
+        let a = answer_in("!room:example.com", 3);
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, "👍"),
+            Err(ReactionRejection::NotANumberedReaction)
+        );
+    }
+
+    /// Covers both an ordinary out-of-range reaction (4️⃣ on a 3-option prompt) and the
+    /// `ExitPlanMode` free-text case once `option_count` is set from
+    /// `reaction_option_count()` rather than the full option list — either way, this
+    /// function doesn't need to know *why* the count is what it is, only that the index
+    /// must stay under it.
+    #[test]
+    fn option_index_past_option_count_is_rejected() {
+        let a = answer_in("!room:example.com", 2);
+        assert_eq!(
+            reaction_claims_answer(&room("!room:example.com"), &a, true, "3️⃣"),
+            Err(ReactionRejection::OptionOutOfRange)
+        );
+    }
 }
