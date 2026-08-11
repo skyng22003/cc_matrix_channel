@@ -163,13 +163,16 @@ pub struct MenuAnswer {
     /// pre-send pane-shape check has the real validated count to check against — not just
     /// a lower bound inferred from which index was picked.
     pub option_count: usize,
-    /// Set only by the reply-feedback path (`ExitPlanMode` only — see
-    /// `PendingPrompt::decline_option_index`'s doc for why `AskUserQuestion` has no
-    /// equivalent). `Some(text)` tells `tmux_relay::TmuxRelay::answer_prompt` to type
-    /// `text` into the free-text option and submit with `shift+tab` rather than `Enter` —
-    /// confirmed live this approves the plan *and* attaches `text` as feedback in the same
-    /// turn, distinct from a plain numbered/decline answer (`None`), which never types
-    /// anything.
+    /// Set only by the reply-with-text path — `handle_message`'s reply interception,
+    /// never `handle_reaction`. `Some(text)` tells
+    /// `tmux_relay::TmuxRelay::answer_prompt` to type `text` into the free-text option
+    /// (`PendingAnswer::decline_option_index`) rather than submitting it blank
+    /// (`None`, a plain numbered or decline answer, which never types anything). What
+    /// happens next differs by kind, both confirmed live:
+    /// - `ExitPlanMode`: submits with `shift+tab` — approves the plan *and* attaches
+    ///   `text` as feedback in the same turn.
+    /// - `AskUserQuestion`: submits with plain `Enter` — `text` *is* the answer, no
+    ///   separate approve step.
     pub feedback: Option<String>,
 }
 
@@ -865,18 +868,22 @@ impl MatrixBridge {
                     crate::rooms::save(&crate::rooms::store_path(), &rooms, Some(&current_room_id));
                 }
 
-                // Reply-with-feedback interception — a reply to a still-pending
-                // `ExitPlanMode` prompt approves the plan and attaches the reply text as
-                // feedback, the outcome `shift+tab` produces at the terminal (confirmed
-                // live — see `tools/menu-spike/FINDINGS.md`'s options-4/5/3 section).
-                // `AskUserQuestion` has no equivalent text-capture path at all (both of its
-                // fixed trailing options were confirmed to just reject), so a reply to one
-                // of those prompts falls through and forwards as an ordinary message,
-                // same as always.
+                // Reply-with-text interception — a reply to a still-pending prompt claims
+                // it the same way a reaction does, just with typed text attached instead
+                // of a numbered choice (confirmed live for both kinds — see
+                // `tools/menu-spike/FINDINGS.md`'s options-4/5/3 section):
+                // - `ExitPlanMode`: approves the plan and attaches the reply text as
+                //   feedback in the same turn, the outcome `shift+tab` produces at the
+                //   terminal.
+                // - `AskUserQuestion`: the reply text *is* the answer — the same fixed
+                //   "Type something." option that declines when submitted blank captures
+                //   whatever's typed into it as the model's real answer.
+                // Both reuse `answer.decline_option_index` as the target: it's the same
+                // free-text box either way, just a different final keystroke
+                // (`tmux_relay::TmuxRelay::answer_prompt` decides that part).
                 if let Some(target) = reply_target.clone() {
                     let claimed = pending_answers.lock().get(&target).cloned();
                     if let Some(answer) = claimed
-                        && answer.kind == crate::pending_prompt::PromptKind::ExitPlanMode
                         // Single-shot claim, same idiom `handle_reaction` uses: only the
                         // reply that actually removes the entry proceeds.
                         && pending_answers.lock().remove(&target).is_some()

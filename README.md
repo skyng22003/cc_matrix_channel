@@ -136,16 +136,18 @@ session's entry reads as if there were no pending prompt at all.
 `tools/menu-spike/FINDINGS.md`'s options-4/5/3 section:
 
 - **❌ decline** — react with ❌ (pre-seeded alongside the numbered options) to reject the
-  prompt outright. For `AskUserQuestion` this hits the CLI's own fixed reject entry (its
-  two trailing options beyond the model's own choices behave identically — neither can
-  capture text through this tool at all); for `ExitPlanMode` it's "Tell Claude what to
-  change" with nothing typed, a plain rejection.
-- **Reply with feedback** — `ExitPlanMode` only. Reply (not just send a new message) to the
-  prompt message with your feedback text, and the bridge types it into the free-text
-  option and submits with `shift+tab` instead of `Enter` — this **approves the plan and
-  attaches your text as feedback in the same turn**, not a reject-then-retry round trip.
-  There is no equivalent for `AskUserQuestion`: its own free-text-looking options were
-  confirmed to have no text-capture path at all.
+  prompt outright, submitted blank. For `AskUserQuestion` this hits the CLI's own "Type
+  something." entry (its other trailing option, "Chat about this", also declines but
+  additionally makes Claude auto-continue with a clarifying question — not wired up
+  separately, since a decline plus a real reply already covers it); for `ExitPlanMode` it's
+  "Tell Claude what to change" with nothing typed.
+- **Reply with text** — reply (not just send a new message) to the prompt message with
+  your own text, and the bridge types it into that same free-text option instead of
+  submitting it blank:
+  - `ExitPlanMode`: submits with `shift+tab` instead of `Enter` — **approves the plan and
+    attaches your text as feedback in the same turn**, not a reject-then-retry round trip.
+  - `AskUserQuestion`: submits with plain `Enter` — **your text becomes Claude's actual
+    answer** to the question, the same as picking a real option.
 
 | Variable | Required | Description |
 |---|---|---|

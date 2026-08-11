@@ -126,25 +126,33 @@ impl PendingPrompt {
         }
     }
 
-    /// Which `tmux_relay` option index a ❌ decline reaction should send — confirmed live
-    /// (`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section) for both kinds, distinct
-    /// from every numbered `options[N]` entry:
+    /// Which `tmux_relay` option index a ❌ decline reaction (or a reply-with-text) should
+    /// target — confirmed live (`tools/menu-spike/FINDINGS.md`'s options-4/5/3 section) for
+    /// both kinds, distinct from every numbered `options[N]` entry. **The same index is a
+    /// dual-purpose free-text box, for both kinds** — submitted blank (`Enter`/`Down`s+
+    /// `Enter`) it declines; submitted with typed text it captures that text as a real
+    /// answer (`AskUserQuestion`, plain `Enter`) or approves-with-feedback (`ExitPlanMode`,
+    /// `shift+tab`) — see `MenuAnswer::feedback`'s doc for the dispatch. **This was gotten
+    /// wrong once already**: the first version of this doc claimed neither kind's fixed
+    /// option could capture text at all — the original spike tested what selecting the
+    /// option *does*, never what typing into it first does. Corrected only after Sky asked
+    /// why the label ("Type something.") wasn't being honored.
     ///
     /// - `AskUserQuestion`: one past the last real option. The CLI always renders two more
     ///   fixed entries after the model's own choices ("options 4 and 5" in the common
-    ///   3-option case Sky first noticed) — confirmed live that selecting *either* rejects
-    ///   the tool call identically, with no way to capture text through this path. This
-    ///   targets the first of the two (`options.len()`, i.e. digit `options.len() + 1`);
-    ///   the second is redundant to also send.
-    /// - `ExitPlanMode`: the last of the three fixed options ("Tell Claude what to change"),
-    ///   pressed with `Enter` and no typed feedback — confirmed live this is a plain
-    ///   rejection, the same outcome as `AskUserQuestion`'s fixed entries. This is
-    ///   `options.len() - 1` (index 2), already present in `options` unlike the
+    ///   3-option case Sky first noticed) — this targets the first of the two,
+    ///   "Type something." (`options.len()`, i.e. digit `options.len() + 1`). The second,
+    ///   "Chat about this", was tried once out of curiosity: also declines, but
+    ///   additionally makes the model auto-continue with a clarifying question — a real
+    ///   third behavior, not wired up here (a plain decline plus a real reply already
+    ///   covers the same ground without a second keystroke path to maintain).
+    /// - `ExitPlanMode`: the last of the three fixed options ("Tell Claude what to change").
+    ///   This is `options.len() - 1` (index 2), already present in `options` unlike the
     ///   `AskUserQuestion` case above.
     ///
-    /// Only meaningful when [`answerable_by_reaction`] is true — callers gate the ❌ offer
-    /// on that flag, the same as the numbered ones, rather than guessing at an unsupported
-    /// shape's real option count.
+    /// Only meaningful when [`answerable_by_reaction`] is true — callers gate both the ❌
+    /// offer and the reply-with-text path on that flag, the same as the numbered ones,
+    /// rather than guessing at an unsupported shape's real option count.
     ///
     /// [`answerable_by_reaction`]: PendingPrompt::answerable_by_reaction
     pub fn decline_option_index(&self) -> usize {

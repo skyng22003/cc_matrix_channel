@@ -374,13 +374,21 @@ fn render_prompt(p: &PendingPrompt) -> String {
             }
         }
         body.push_str("\nReact with a number to answer, or ❌ to decline.");
-        if p.kind == PromptKind::ExitPlanMode {
-            // The one case a reaction can't express: approve, but with a change. Confirmed
-            // live this is a genuinely different outcome from ❌ (a plain reject followed
-            // by a fresh message costs a whole extra plan/approval round trip) — see
+        match p.kind {
+            // Approve, but with a change — a reaction can't express that. Confirmed live
+            // this is a genuinely different outcome from ❌ (a plain reject followed by a
+            // fresh message costs a whole extra plan/approval round trip) — see
             // `PendingPrompt::decline_option_index`'s doc and `MatrixBridge::handle_message`'s
-            // reply-feedback interception.
-            body.push_str("\nOr reply to *this* message to approve with feedback.");
+            // reply-with-text interception.
+            PromptKind::ExitPlanMode => {
+                body.push_str("\nOr reply to *this* message to approve with feedback.");
+            }
+            // None of the numbered options fit — reply instead of picking one. Confirmed
+            // live the same free-text box exists here too, just answered with a plain
+            // `Enter` rather than `shift+tab` (no separate "approve" step for a question).
+            PromptKind::AskUserQuestion => {
+                body.push_str("\nOr reply to *this* message with your own answer.");
+            }
         }
     } else {
         // Multi-select, multiple questions, or more options than there are keycap emoji —
