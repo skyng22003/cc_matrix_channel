@@ -1106,6 +1106,38 @@ where
     });
 }
 
+/// Send a reaction from the bridge's own account onto `event_id` — used by
+/// `live_status.rs` to pre-seed the numbered keycap reactions on a freshly-posted
+/// pending-prompt message. Confirmed in practice this matters, not just a nice-to-have:
+/// without an existing reaction to tap, answering means opening the client's full emoji
+/// picker and finding the right keycap by hand every time — tapping an *existing*
+/// reaction (added by anyone, bot included) is the low-friction path most Matrix clients
+/// support instead.
+///
+/// Called directly (awaited) from `live_status.rs`'s own tick-loop task, not the sync-loop
+/// event handler — matches that file's existing `send_status`/`edit_status`, which do the
+/// same. `spawn_room_send`'s fire-and-forget-with-timeout wrapping exists specifically to
+/// protect the sync loop from blocking, which doesn't apply here.
+pub async fn react(
+    client: &Client,
+    room_id: &OwnedRoomId,
+    event_id: &OwnedEventId,
+    emoji: &str,
+) -> bool {
+    let Some(room) = client.get_room(room_id) else {
+        return false;
+    };
+    let annotation = Annotation::new(event_id.clone(), emoji.to_string());
+    let content = ReactionEventContent::new(annotation);
+    match room.send(content).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("Failed to pre-seed reaction {emoji} on {event_id}: {e}");
+            false
+        }
+    }
+}
+
 // --- Session persistence ---
 
 fn session_file_path(store_path: &str) -> PathBuf {

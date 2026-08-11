@@ -837,6 +837,20 @@ pub fn spawn(
                                             room_id: room_id.clone(),
                                         },
                                     );
+                                    // Pre-seed the numbered reactions on our own message —
+                                    // confirmed live this matters: without an existing
+                                    // reaction to tap, answering means digging through the
+                                    // client's full emoji picker to find the right keycap
+                                    // by hand every time, instead of just tapping a pill
+                                    // that's already there.
+                                    for i in 0..p.reaction_option_count() {
+                                        let emoji = crate::matrix::NUMBER_EMOJI
+                                            .get(i)
+                                            .copied()
+                                            .unwrap_or("?");
+                                        crate::matrix::react(&client, &room_id, &event_id, emoji)
+                                            .await;
+                                    }
                                 }
                                 tracing::info!(
                                     room_id = %room_id,
