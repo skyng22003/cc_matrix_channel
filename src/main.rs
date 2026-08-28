@@ -4,6 +4,7 @@ mod fallback_reply;
 mod live_status;
 mod matrix;
 mod mcp;
+mod nerv_status;
 mod pending_prompt;
 mod rooms;
 mod status;
@@ -93,6 +94,16 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::parse();
+
+    // NERV status reporting is entirely optional — `None` unless both `NERV_BASE_URL` and
+    // `NERV_BEARER_TOKEN` are set. Built once here and reused across both `live_status::spawn`
+    // call sites below (startup and the setup-mode hot-transition in `mcp.rs`).
+    let nerv_target = nerv_status::NervTarget::from_config(&config);
+    tracing::info!(
+        nerv_reporting_enabled = nerv_target.is_some(),
+        "NERV status reporting configured"
+    );
+    let nerv_http = reqwest::Client::new();
 
     // Graceful shutdown coordination
     let cancel = CancellationToken::new();
@@ -205,14 +216,16 @@ async fn main() -> Result<()> {
     // Live agent-status message. Alongside the parent-PID poll above, this is the other
     // signal that does not depend on the agent being responsive enough to speak for itself.
     if let Some(client) = matrix_client.clone() {
-        live_status::spawn(
+        live_status::spawn(live_status::LiveStatusConfig {
             client,
-            known_rooms.clone(),
-            last_active_room.clone(),
-            access_control.clone(),
-            pending_answers.clone(),
-            cancel.clone(),
-        );
+            known_rooms: known_rooms.clone(),
+            last_active_room: last_active_room.clone(),
+            access_control: access_control.clone(),
+            pending_answers: pending_answers.clone(),
+            nerv_target: nerv_target.clone(),
+            nerv_http: nerv_http.clone(),
+            cancel: cancel.clone(),
+        });
     }
 
     // tmux keystroke relay for menu answers. Detecting and posting pending prompts (above)
@@ -274,6 +287,8 @@ async fn main() -> Result<()> {
         permission_verdict_rx,
         store_path: PathBuf::from(&config.store_path),
         env_path,
+        nerv_target,
+        nerv_http,
         cancel: cancel.clone(),
     });
 

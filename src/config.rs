@@ -55,6 +55,16 @@ pub struct Config {
     /// operator deliberately opting in.
     #[arg(long, env = "CC_MATRIX_TMUX_ANSWERS_ENABLED", default_value_t = false)]
     pub tmux_answers_enabled: bool,
+
+    /// Base URL of the NERV console (e.g. https://agents-stable.internal:3335). Optional —
+    /// status reporting to NERV only runs when this and `nerv_bearer_token` are both set.
+    #[arg(long, env = "NERV_BASE_URL")]
+    pub nerv_base_url: Option<String>,
+
+    /// Per-agent bearer token minted by NERV (`vela` or `magi`, not `MATRIX_USER_ID` — NERV
+    /// maps the token to identity server-side) — use NERV_BEARER_TOKEN env var.
+    #[arg(long, env = "NERV_BEARER_TOKEN", hide = true)]
+    pub nerv_bearer_token: Option<String>,
 }
 
 impl fmt::Debug for Config {
@@ -75,6 +85,11 @@ impl fmt::Debug for Config {
             )
             .field("tmux_pane", &self.tmux_pane)
             .field("tmux_answers_enabled", &self.tmux_answers_enabled)
+            .field("nerv_base_url", &self.nerv_base_url)
+            .field(
+                "nerv_bearer_token",
+                &self.nerv_bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }

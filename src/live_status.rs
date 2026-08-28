@@ -546,15 +546,33 @@ async fn post_fallback_chunks(
     sent
 }
 
+/// Constructor arguments for [`spawn`], grouped into a struct once the plain-argument list
+/// grew past clippy's `too_many_arguments` threshold — same reasoning as
+/// [`crate::mcp::McpServerConfig`].
+pub struct LiveStatusConfig {
+    pub client: Arc<Client>,
+    pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    pub last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
+    pub access_control: Arc<AccessControl>,
+    pub pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>>,
+    pub nerv_target: Option<crate::nerv_status::NervTarget>,
+    pub nerv_http: reqwest::Client,
+    pub cancel: CancellationToken,
+}
+
 /// Spawn the live-status loop. Returns immediately.
-pub fn spawn(
-    client: Arc<Client>,
-    known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-    last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
-    access_control: Arc<AccessControl>,
-    pending_answers: Arc<parking_lot::Mutex<HashMap<OwnedEventId, PendingAnswer>>>,
-    cancel: CancellationToken,
-) {
+pub fn spawn(config: LiveStatusConfig) {
+    let LiveStatusConfig {
+        client,
+        known_rooms,
+        last_active_room,
+        access_control,
+        pending_answers,
+        nerv_target,
+        nerv_http,
+        cancel,
+    } = config;
+
     tokio::spawn(async move {
         let threshold = stall_threshold();
         let delay = draft_delay();
@@ -597,6 +615,9 @@ pub fn spawn(
         // The message tracking a pending AskUserQuestion/ExitPlanMode prompt, if any —
         // entirely separate from `draft` above, see `MenuDraft`'s doc comment.
         let mut menu: Option<MenuDraft> = None;
+        // Last time a NERV status report was sent, regardless of outcome — drives the
+        // heartbeat cadence in `crate::nerv_status`. `None` until the first push.
+        let mut last_nerv_push: Option<std::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -606,8 +627,28 @@ pub fn spawn(
 
             let status = read_status(threshold);
 
-            // Report a transcript switch before anything else: it reframes every number
-            // logged below it.
+            // NERV status push — a sibling effect, deliberately independent of the Matrix
+            // draft machinery below: it must run every tick regardless of `Action`, and
+            // regardless of whether any room has talked to us yet (unlike the draft, which
+            // has nothing to post to without one). Fires on every state transition, plus a
+            // periodic heartbeat so NERV can distinguish "idle" from "gone silent". See
+            // `crate::nerv_status`'s module doc for the full design and its privacy note.
+            if let Some(target) = &nerv_target {
+                let state_changed = previous != Some(status.state);
+                let heartbeat_due = last_nerv_push
+                    .is_none_or(|t| t.elapsed() >= crate::nerv_status::HEARTBEAT_INTERVAL);
+                if state_changed || heartbeat_due {
+                    let report = crate::nerv_status::StatusReport::from_status(
+                        &status,
+                        std::time::SystemTime::now(),
+                    );
+                    crate::nerv_status::spawn_report(nerv_http.clone(), target.clone(), report);
+                    last_nerv_push = Some(std::time::Instant::now());
+                }
+            }
+
+            // Report a transcript switch before any other logging this tick: it reframes
+            // every number logged below it.
             let resolved = crate::status::transcript_path_with_source();
             if resolved != last_transcript {
                 match (&resolved, &last_transcript) {

@@ -116,6 +116,8 @@ pub struct McpServerConfig {
     pub permission_verdict_rx: mpsc::Receiver<PermissionVerdict>,
     pub store_path: PathBuf,
     pub env_path: PathBuf,
+    pub nerv_target: Option<crate::nerv_status::NervTarget>,
+    pub nerv_http: reqwest::Client,
     pub cancel: CancellationToken,
 }
 
@@ -136,6 +138,8 @@ pub struct MatrixChannelServer {
     permission_verdict_rx: Arc<Mutex<Option<mpsc::Receiver<PermissionVerdict>>>>,
     store_path: PathBuf,
     env_path: PathBuf,
+    nerv_target: Option<crate::nerv_status::NervTarget>,
+    nerv_http: reqwest::Client,
     cancel: CancellationToken,
     tool_router: ToolRouter<Self>,
 }
@@ -160,6 +164,8 @@ impl MatrixChannelServer {
             permission_verdict_rx: Arc::new(Mutex::new(Some(config.permission_verdict_rx))),
             store_path: config.store_path,
             env_path: config.env_path,
+            nerv_target: config.nerv_target,
+            nerv_http: config.nerv_http,
             cancel: config.cancel,
             tool_router: Self::tool_router(),
         }
@@ -1137,14 +1143,16 @@ impl MatrixChannelServer {
         // Start live status here too: main() only spawns it when credentials already
         // exist at startup, so without this the feature stays dead for any bridge that
         // came up in setup mode and hot-transitioned.
-        crate::live_status::spawn(
+        crate::live_status::spawn(crate::live_status::LiveStatusConfig {
             client,
-            self.known_rooms.clone(),
-            self.last_active_room.clone(),
-            self.access_control.clone(),
-            self.pending_answers.clone(),
-            self.cancel.clone(),
-        );
+            known_rooms: self.known_rooms.clone(),
+            last_active_room: self.last_active_room.clone(),
+            access_control: self.access_control.clone(),
+            pending_answers: self.pending_answers.clone(),
+            nerv_target: self.nerv_target.clone(),
+            nerv_http: self.nerv_http.clone(),
+            cancel: self.cancel.clone(),
+        });
 
         // Spawn Matrix sync loop
         let cancel = self.cancel.clone();

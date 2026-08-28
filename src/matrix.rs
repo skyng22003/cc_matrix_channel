@@ -1295,7 +1295,12 @@ pub fn extract_mxc_uri(source: &matrix_sdk::ruma::events::room::MediaSource) -> 
     }
 }
 
-fn humanize_timestamp(time: std::time::SystemTime) -> String {
+/// Formats a `SystemTime` as an RFC3339 UTC timestamp (`2026-08-08T15:56:53Z`).
+///
+/// Hand-rolled rather than pulling in `chrono` — see the parsing side's rationale at
+/// [`crate::status::parse_timestamp`]. `pub(crate)` because [`crate::nerv_status`] reuses it
+/// for `updated_at` rather than duplicating the calendar math.
+pub(crate) fn humanize_timestamp(time: std::time::SystemTime) -> String {
     let duration = time
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
