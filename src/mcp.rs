@@ -831,27 +831,22 @@ impl MatrixChannelServer {
                     if let AnySyncTimelineEvent::MessageLike(
                         matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg),
                     ) = any_event
+                        && let Some(original) = msg.as_original()
                     {
-                        if let Some(original) = msg.as_original() {
-                            let sender = original.sender.as_str();
-                            let event_id = original.event_id.clone();
+                        let sender = original.sender.as_str();
+                        let event_id = original.event_id.clone();
 
-                            use matrix_sdk::ruma::events::room::message::Relation;
-                            let (target_id, msgtype, edited) = match &original.content.relates_to {
-                                Some(Relation::Replacement(repl)) => {
-                                    (repl.event_id.clone(), &repl.new_content.msgtype, true)
-                                }
-                                _ => (event_id.clone(), &original.content.msgtype, false),
-                            };
+                        use matrix_sdk::ruma::events::room::message::Relation;
+                        let (target_id, msgtype, edited) = match &original.content.relates_to {
+                            Some(Relation::Replacement(repl)) => {
+                                (repl.event_id.clone(), &repl.new_content.msgtype, true)
+                            }
+                            _ => (event_id.clone(), &original.content.msgtype, false),
+                        };
 
-                            let line = Self::render_message_line(
-                                target_id.as_str(),
-                                sender,
-                                msgtype,
-                                edited,
-                            );
-                            page.push((target_id, line));
-                        }
+                        let line =
+                            Self::render_message_line(target_id.as_str(), sender, msgtype, edited);
+                        page.push((target_id, line));
                     }
                 }
             }
