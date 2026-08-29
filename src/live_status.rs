@@ -332,13 +332,15 @@ fn render_terminal(status: &AgentStatus) -> String {
 /// exists to make a phone buzz, not to be read in full on a lock screen.
 fn render_alert(status: &AgentStatus) -> String {
     let body = match status.state {
-        AgentState::Dead => "❌ **Claude is not running** — the session ended".to_string(),
+        // Matches `status_heading`'s own "Not running" for `Dead` — same drop-"Claude is"
+        // call, extended here for the same reason: Sky's ask.
+        AgentState::Dead => "❌ **Not running** — the session ended".to_string(),
         _ => match status.last_activity_age {
             Some(age) => format!(
-                "⚠️ **Claude looks stuck** — no activity for {}",
+                "⚠️ **Stuck** — no activity for {}",
                 crate::status::format_duration(age)
             ),
-            None => "⚠️ **Claude looks stuck**".to_string(),
+            None => "⚠️ **Stuck**".to_string(),
         },
     };
     truncate(body)
@@ -354,7 +356,7 @@ fn render_alert(status: &AgentStatus) -> String {
 fn render_prompt(p: &PendingPrompt) -> String {
     let mut body = match p.kind {
         PromptKind::AskUserQuestion => {
-            let mut b = String::from("❓ **Claude is asking**\n");
+            let mut b = String::from("❓ **Question**\n");
             if let Some(h) = &p.header {
                 b.push_str(&format!("*{h}*\n"));
             }
@@ -364,7 +366,7 @@ fn render_prompt(p: &PendingPrompt) -> String {
             b
         }
         PromptKind::ExitPlanMode => {
-            let mut b = String::from("📝 **Claude wants to proceed with a plan**\n\n");
+            let mut b = String::from("📝 **Proposed plan**\n\n");
             if let Some(plan) = &p.plan {
                 b.push_str(plan);
             }
@@ -1244,11 +1246,11 @@ mod tests {
     #[test]
     fn alert_body_is_self_contained() {
         let stalled = render_alert(&status(AgentState::Stalled));
-        assert!(stalled.contains("stuck"));
+        assert!(stalled.contains("Stuck"));
         assert!(stalled.contains("4s"), "should carry the age: {stalled}");
 
         let dead = render_alert(&status(AgentState::Dead));
-        assert!(dead.contains("not running"));
+        assert!(dead.contains("Not running"));
 
         // Metadata only, same rule as everywhere else in this module.
         for body in [stalled, dead] {
@@ -1424,6 +1426,18 @@ mod tests {
         let terminal = render_terminal(&status(AgentState::Stalled));
         assert!(terminal.contains("Stalled"));
         assert!(terminal.contains("3m 20s"));
+    }
+
+    #[test]
+    fn alert_and_prompt_headings_drop_claude_too() {
+        let stalled = render_alert(&status(AgentState::Stalled));
+        assert!(!stalled.contains("Claude"));
+        let dead = render_alert(&status(AgentState::Dead));
+        assert!(!dead.contains("Claude"));
+
+        let question = render_prompt(&ask_prompt(&["Red", "Green"]));
+        assert!(question.contains("**Question**"));
+        assert!(!question.contains("Claude is asking"));
     }
 
     #[test]
