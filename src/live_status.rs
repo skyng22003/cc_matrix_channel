@@ -276,8 +276,23 @@ fn decide(
     }
 }
 
+/// Friendly, standalone state label for the live status heading — Sky's call to drop
+/// "Claude is" entirely and warm up "waiting for you." Deliberately separate from
+/// `AgentState`'s own `Display` impl, which stays as-is: that text is written to read
+/// naturally after "Agent:" in `AgentStatus::render()`'s technical `/status` detail line,
+/// a different context this heading has no business changing.
+fn status_heading(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "Working",
+        AgentState::WaitingForUser => "All yours",
+        AgentState::Stalled => "Stalled",
+        AgentState::Dead => "Not running",
+        AgentState::Unknown => "Unknown",
+    }
+}
+
 fn render_working(status: &AgentStatus) -> String {
-    let mut body = format!("⏳ **Claude is {}**", status.state);
+    let mut body = format!("⏳ **{}**", status_heading(status.state));
     let detail = status.render();
     // Drop the leading "Agent:" line — the heading above already says it.
     if let Some(rest) = detail.split_once('\n').map(|(_, r)| r) {
@@ -293,7 +308,7 @@ fn render_terminal(status: &AgentStatus) -> String {
         AgentState::Dead => "❌",
         _ => "✅",
     };
-    let mut body = format!("{icon} **Claude is {}**", status.state);
+    let mut body = format!("{icon} **{}**", status_heading(status.state));
     if let Some(elapsed) = status.turn_elapsed {
         body.push_str(&format!(
             "\nTurn ran for {}",
@@ -1404,11 +1419,22 @@ mod tests {
     fn rendered_bodies_are_metadata_only() {
         let working = render_working(&status(AgentState::Working));
         assert!(working.contains("Bash"));
-        assert!(working.contains("working"));
+        assert!(working.contains("Working"));
 
         let terminal = render_terminal(&status(AgentState::Stalled));
-        assert!(terminal.contains("stalled"));
+        assert!(terminal.contains("Stalled"));
         assert!(terminal.contains("3m 20s"));
+    }
+
+    #[test]
+    fn status_heading_drops_claude_is_and_reads_standalone() {
+        let working = render_working(&status(AgentState::Working));
+        assert!(working.contains("**Working**"));
+        assert!(!working.contains("Claude is"));
+
+        let waiting = render_terminal(&status(AgentState::WaitingForUser));
+        assert!(waiting.contains("**All yours**"));
+        assert!(!waiting.contains("Claude is"));
     }
 
     #[test]
