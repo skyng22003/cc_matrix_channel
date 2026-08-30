@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -689,6 +690,104 @@ impl MatrixChannelServer {
         ))]))
     }
 
+    /// Renders one distinct `fetch_messages` output line for `event_id`/`sender`/`msgtype`.
+    ///
+    /// `edited` appends an `(edited)` marker — used when this line was produced by folding
+    /// an `m.replace` relation into its target message rather than a fresh event.
+    fn render_message_line(
+        event_id: &str,
+        sender: &str,
+        msgtype: &MessageType,
+        edited: bool,
+    ) -> String {
+        let suffix = if edited { " (edited)" } else { "" };
+        match msgtype {
+            MessageType::Text(text) => format!("[{event_id}] {sender}: {}{suffix}\n", text.body),
+            MessageType::Image(img) => {
+                let mxc = crate::matrix::extract_mxc_uri(&img.source);
+                format!(
+                    "[{event_id}] {sender}: [image: {} | mxc: {mxc}]{suffix}\n",
+                    img.body
+                )
+            }
+            MessageType::File(file) => {
+                let mxc = crate::matrix::extract_mxc_uri(&file.source);
+                format!(
+                    "[{event_id}] {sender}: [file: {} | mxc: {mxc}]{suffix}\n",
+                    file.body
+                )
+            }
+            MessageType::Audio(audio) => {
+                let mxc = crate::matrix::extract_mxc_uri(&audio.source);
+                format!(
+                    "[{event_id}] {sender}: [audio: {} | mxc: {mxc}]{suffix}\n",
+                    audio.body
+                )
+            }
+            MessageType::Video(video) => {
+                let mxc = crate::matrix::extract_mxc_uri(&video.source);
+                format!(
+                    "[{event_id}] {sender}: [video: {} | mxc: {mxc}]{suffix}\n",
+                    video.body
+                )
+            }
+            _ => format!("[{event_id}] {sender}: [other]{suffix}\n"),
+        }
+    }
+
+    /// Merges one page of `fetch_messages` lines into the accumulated output, keyed by each
+    /// message's *target* event id (an edit's target is the event it replaces; a plain
+    /// message's target is itself).
+    ///
+    /// `page` must be chronologically OLDER than everything already in `lines`/`index` — the
+    /// homeserver's `/messages` endpoint pages backward from "now", so callers merge pages in
+    /// that order (newest page first) and this function prepends. An id already in `index`
+    /// (an edit whose target was seen in a newer page, or a repeat edit) updates that line in
+    /// place instead of creating a duplicate; a genuinely new id is inserted before the
+    /// existing lines, in this page's own chronological order.
+    fn merge_message_page(
+        lines: &mut Vec<String>,
+        index: &mut HashMap<OwnedEventId, usize>,
+        page: Vec<(OwnedEventId, String)>,
+    ) {
+        // Within this page, a later event for the same target (e.g. two edits of one message
+        // landing in the same page) supersedes an earlier one — collapse in the page's own
+        // chronological order first.
+        let mut collapsed: Vec<(OwnedEventId, String)> = Vec::new();
+        let mut seen_in_page: HashMap<OwnedEventId, usize> = HashMap::new();
+        for (target_id, line) in page {
+            if let Some(&pos) = seen_in_page.get(&target_id) {
+                collapsed[pos].1 = line;
+            } else {
+                seen_in_page.insert(target_id.clone(), collapsed.len());
+                collapsed.push((target_id, line));
+            }
+        }
+
+        // Across pages, pages are merged newest-first: anything already in the global index
+        // is already at least as new as what this (older) page could offer, so skip it rather
+        // than overwrite — otherwise a stale pre-edit original fetched from an older page
+        // would clobber a newer edit already recorded. Genuinely new ids are prepended, in
+        // this page's own chronological order.
+        let new_entries: Vec<(OwnedEventId, String)> = collapsed
+            .into_iter()
+            .filter(|(id, _)| !index.contains_key(id))
+            .collect();
+        if new_entries.is_empty() {
+            return;
+        }
+        for pos in index.values_mut() {
+            *pos += new_entries.len();
+        }
+        let mut combined = Vec::with_capacity(lines.len() + new_entries.len());
+        for (i, (id, line)) in new_entries.into_iter().enumerate() {
+            index.insert(id, i);
+            combined.push(line);
+        }
+        combined.append(lines);
+        *lines = combined;
+    }
+
     #[tool(description = "Fetch recent messages from a Matrix room. Returns up to 50 messages.")]
     async fn fetch_messages(
         &self,
@@ -699,80 +798,75 @@ impl MatrixChannelServer {
         let room = self.get_room(&room_id)?;
 
         let limit = limit.unwrap_or(10).min(50);
-        let options = matrix_sdk::room::MessagesOptions::backward();
 
-        let messages = room.messages(options).await.map_err(|e| {
-            tracing::error!("Failed to fetch messages: {e}");
-            McpError::internal_error("Failed to fetch messages".to_string(), None)
-        })?;
+        let mut lines: Vec<String> = Vec::new();
+        let mut index: HashMap<OwnedEventId, usize> = HashMap::new();
+        let mut from: Option<String> = None;
 
-        let mut output = String::new();
-        let mut count = 0u32;
-        for event in messages.chunk.iter().rev() {
-            if count >= limit {
+        // Edits arrive as separate `m.replace` timeline events, so a page of raw events can
+        // collapse into far fewer distinct messages once folded together. Paginate backward
+        // until we have `limit` distinct messages or run out of room history; capped so a
+        // heavily-edited or sparse room can't turn one call into unbounded homeserver requests.
+        const MAX_PAGES: u32 = 10;
+        for _ in 0..MAX_PAGES {
+            let mut options = matrix_sdk::room::MessagesOptions::backward();
+            options.limit = limit.into();
+            if let Some(token) = from.as_deref() {
+                options = options.from(token);
+            }
+
+            let messages = room.messages(options).await.map_err(|e| {
+                tracing::error!("Failed to fetch messages: {e}");
+                McpError::internal_error("Failed to fetch messages".to_string(), None)
+            })?;
+
+            if messages.chunk.is_empty() {
                 break;
             }
-            if let Ok(any_event) = event.clone().into_raw().deserialize() {
-                use matrix_sdk::ruma::events::AnySyncTimelineEvent;
-                if let AnySyncTimelineEvent::MessageLike(
-                    matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg),
-                ) = any_event
-                {
-                    let original = msg.as_original();
-                    if let Some(original) = original {
+
+            let mut page: Vec<(OwnedEventId, String)> = Vec::new();
+            for event in messages.chunk.iter().rev() {
+                if let Ok(any_event) = event.clone().into_raw().deserialize() {
+                    use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+                    if let AnySyncTimelineEvent::MessageLike(
+                        matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(msg),
+                    ) = any_event
+                        && let Some(original) = msg.as_original()
+                    {
                         let sender = original.sender.as_str();
-                        let event_id = original.event_id.as_str();
-                        use matrix_sdk::ruma::events::room::message::MessageType;
-                        match &original.content.msgtype {
-                            MessageType::Text(text) => {
-                                output.push_str(&format!("[{event_id}] {sender}: {}\n", text.body));
-                                count += 1;
+                        let event_id = original.event_id.clone();
+
+                        use matrix_sdk::ruma::events::room::message::Relation;
+                        let (target_id, msgtype, edited) = match &original.content.relates_to {
+                            Some(Relation::Replacement(repl)) => {
+                                (repl.event_id.clone(), &repl.new_content.msgtype, true)
                             }
-                            MessageType::Image(img) => {
-                                let mxc = crate::matrix::extract_mxc_uri(&img.source);
-                                output.push_str(&format!(
-                                    "[{event_id}] {sender}: [image: {} | mxc: {mxc}]\n",
-                                    img.body
-                                ));
-                                count += 1;
-                            }
-                            MessageType::File(file) => {
-                                let mxc = crate::matrix::extract_mxc_uri(&file.source);
-                                output.push_str(&format!(
-                                    "[{event_id}] {sender}: [file: {} | mxc: {mxc}]\n",
-                                    file.body
-                                ));
-                                count += 1;
-                            }
-                            MessageType::Audio(audio) => {
-                                let mxc = crate::matrix::extract_mxc_uri(&audio.source);
-                                output.push_str(&format!(
-                                    "[{event_id}] {sender}: [audio: {} | mxc: {mxc}]\n",
-                                    audio.body
-                                ));
-                                count += 1;
-                            }
-                            MessageType::Video(video) => {
-                                let mxc = crate::matrix::extract_mxc_uri(&video.source);
-                                output.push_str(&format!(
-                                    "[{event_id}] {sender}: [video: {} | mxc: {mxc}]\n",
-                                    video.body
-                                ));
-                                count += 1;
-                            }
-                            _ => {
-                                output.push_str(&format!("[{event_id}] {sender}: [other]\n"));
-                                count += 1;
-                            }
-                        }
+                            _ => (event_id.clone(), &original.content.msgtype, false),
+                        };
+
+                        let line =
+                            Self::render_message_line(target_id.as_str(), sender, msgtype, edited);
+                        page.push((target_id, line));
                     }
                 }
             }
+            Self::merge_message_page(&mut lines, &mut index, page);
+
+            if lines.len() >= limit as usize {
+                break;
+            }
+
+            match messages.end {
+                Some(token) => from = Some(token),
+                None => break,
+            }
         }
 
-        if output.is_empty() {
-            output = "No messages found.".to_string();
-        }
+        let output = if lines.is_empty() {
+            "No messages found.".to_string()
+        } else {
+            lines.concat()
+        };
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -1196,5 +1290,134 @@ mod tests {
         assert_eq!(chunks[0].len(), 4096);
         assert_eq!(chunks[1].len(), 4096);
         assert_eq!(chunks[2].len(), 1808);
+    }
+
+    fn eid(id: &str) -> OwnedEventId {
+        matrix_sdk::ruma::EventId::parse(id).unwrap()
+    }
+
+    #[test]
+    fn render_message_line_plain_text_has_no_edited_marker() {
+        let msgtype = MessageType::text_plain("hello");
+        let line = MatrixChannelServer::render_message_line(
+            "$a:example.org",
+            "@sky:example.org",
+            &msgtype,
+            false,
+        );
+        assert_eq!(line, "[$a:example.org] @sky:example.org: hello\n");
+    }
+
+    #[test]
+    fn render_message_line_edited_gets_marker() {
+        let msgtype = MessageType::text_plain("corrected");
+        let line = MatrixChannelServer::render_message_line(
+            "$a:example.org",
+            "@sky:example.org",
+            &msgtype,
+            true,
+        );
+        assert_eq!(
+            line,
+            "[$a:example.org] @sky:example.org: corrected (edited)\n"
+        );
+    }
+
+    #[test]
+    fn merge_message_page_appends_distinct_messages_in_order() {
+        let mut lines = Vec::new();
+        let mut index = HashMap::new();
+        let page = vec![
+            (eid("$a:example.org"), "line a\n".to_string()),
+            (eid("$b:example.org"), "line b\n".to_string()),
+        ];
+        MatrixChannelServer::merge_message_page(&mut lines, &mut index, page);
+        assert_eq!(lines, vec!["line a\n", "line b\n"]);
+    }
+
+    #[test]
+    fn merge_message_page_edit_updates_in_place_within_same_page() {
+        // A message and its edit both land in the same page (the common case: edited shortly
+        // after being sent). The edit — appearing later in the page's chronological order —
+        // must overwrite the original's line, not add a second one.
+        let mut lines = Vec::new();
+        let mut index = HashMap::new();
+        let page = vec![
+            (
+                eid("$a:example.org"),
+                "[$a:example.org] sky: original\n".to_string(),
+            ),
+            (
+                eid("$a:example.org"),
+                "[$a:example.org] sky: corrected (edited)\n".to_string(),
+            ),
+        ];
+        MatrixChannelServer::merge_message_page(&mut lines, &mut index, page);
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "an edit must not consume a second message slot"
+        );
+        assert_eq!(lines[0], "[$a:example.org] sky: corrected (edited)\n");
+    }
+
+    #[test]
+    fn merge_message_page_prepends_older_page_before_existing_lines() {
+        // Simulates pagination: the newest page is merged first, then an older page.
+        let mut lines = Vec::new();
+        let mut index = HashMap::new();
+        MatrixChannelServer::merge_message_page(
+            &mut lines,
+            &mut index,
+            vec![(eid("$new:example.org"), "newer\n".to_string())],
+        );
+        MatrixChannelServer::merge_message_page(
+            &mut lines,
+            &mut index,
+            vec![(eid("$old:example.org"), "older\n".to_string())],
+        );
+
+        assert_eq!(
+            lines,
+            vec!["older\n", "newer\n"],
+            "older page must precede newer page"
+        );
+    }
+
+    #[test]
+    fn merge_message_page_older_page_does_not_clobber_newer_edit() {
+        // Realistic pagination order: the newest page (merged first) contains only the *edit*
+        // of a message whose original sits in an older, not-yet-fetched page — e.g. a message
+        // sent long ago and edited just now.
+        let mut lines = Vec::new();
+        let mut index = HashMap::new();
+        MatrixChannelServer::merge_message_page(
+            &mut lines,
+            &mut index,
+            vec![(
+                eid("$orig:example.org"),
+                "edited text (edited)\n".to_string(),
+            )],
+        );
+        // The older page later supplies the stale, pre-edit original under the same target id.
+        MatrixChannelServer::merge_message_page(
+            &mut lines,
+            &mut index,
+            vec![(
+                eid("$orig:example.org"),
+                "stale pre-edit text\n".to_string(),
+            )],
+        );
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "edit and its original must collapse into a single slot"
+        );
+        assert_eq!(
+            lines[0], "edited text (edited)\n",
+            "an older page must not clobber a newer edit already recorded"
+        );
     }
 }
