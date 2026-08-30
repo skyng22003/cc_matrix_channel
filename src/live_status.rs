@@ -276,8 +276,23 @@ fn decide(
     }
 }
 
+/// Friendly, standalone state label for the live status heading — Sky's call to drop
+/// "Claude is" entirely and warm up "waiting for you." Deliberately separate from
+/// `AgentState`'s own `Display` impl, which stays as-is: that text is written to read
+/// naturally after "Agent:" in `AgentStatus::render()`'s technical `/status` detail line,
+/// a different context this heading has no business changing.
+fn status_heading(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "Working",
+        AgentState::WaitingForUser => "All yours",
+        AgentState::Stalled => "Stalled",
+        AgentState::Dead => "Not running",
+        AgentState::Unknown => "Unknown",
+    }
+}
+
 fn render_working(status: &AgentStatus) -> String {
-    let mut body = format!("⏳ **Claude is {}**", status.state);
+    let mut body = format!("⏳ **{}**", status_heading(status.state));
     let detail = status.render();
     // Drop the leading "Agent:" line — the heading above already says it.
     if let Some(rest) = detail.split_once('\n').map(|(_, r)| r) {
@@ -293,7 +308,7 @@ fn render_terminal(status: &AgentStatus) -> String {
         AgentState::Dead => "❌",
         _ => "✅",
     };
-    let mut body = format!("{icon} **Claude is {}**", status.state);
+    let mut body = format!("{icon} **{}**", status_heading(status.state));
     if let Some(elapsed) = status.turn_elapsed {
         body.push_str(&format!(
             "\nTurn ran for {}",
@@ -317,13 +332,15 @@ fn render_terminal(status: &AgentStatus) -> String {
 /// exists to make a phone buzz, not to be read in full on a lock screen.
 fn render_alert(status: &AgentStatus) -> String {
     let body = match status.state {
-        AgentState::Dead => "❌ **Claude is not running** — the session ended".to_string(),
+        // Matches `status_heading`'s own "Not running" for `Dead` — same drop-"Claude is"
+        // call, extended here for the same reason: Sky's ask.
+        AgentState::Dead => "❌ **Not running** — the session ended".to_string(),
         _ => match status.last_activity_age {
             Some(age) => format!(
-                "⚠️ **Claude looks stuck** — no activity for {}",
+                "⚠️ **Stuck** — no activity for {}",
                 crate::status::format_duration(age)
             ),
-            None => "⚠️ **Claude looks stuck**".to_string(),
+            None => "⚠️ **Stuck**".to_string(),
         },
     };
     truncate(body)
@@ -339,7 +356,7 @@ fn render_alert(status: &AgentStatus) -> String {
 fn render_prompt(p: &PendingPrompt) -> String {
     let mut body = match p.kind {
         PromptKind::AskUserQuestion => {
-            let mut b = String::from("❓ **Claude is asking**\n");
+            let mut b = String::from("❓ **Question**\n");
             if let Some(h) = &p.header {
                 b.push_str(&format!("*{h}*\n"));
             }
@@ -349,7 +366,7 @@ fn render_prompt(p: &PendingPrompt) -> String {
             b
         }
         PromptKind::ExitPlanMode => {
-            let mut b = String::from("📝 **Claude wants to proceed with a plan**\n\n");
+            let mut b = String::from("📝 **Proposed plan**\n\n");
             if let Some(plan) = &p.plan {
                 b.push_str(plan);
             }
@@ -1229,11 +1246,11 @@ mod tests {
     #[test]
     fn alert_body_is_self_contained() {
         let stalled = render_alert(&status(AgentState::Stalled));
-        assert!(stalled.contains("stuck"));
+        assert!(stalled.contains("Stuck"));
         assert!(stalled.contains("4s"), "should carry the age: {stalled}");
 
         let dead = render_alert(&status(AgentState::Dead));
-        assert!(dead.contains("not running"));
+        assert!(dead.contains("Not running"));
 
         // Metadata only, same rule as everywhere else in this module.
         for body in [stalled, dead] {
@@ -1404,11 +1421,34 @@ mod tests {
     fn rendered_bodies_are_metadata_only() {
         let working = render_working(&status(AgentState::Working));
         assert!(working.contains("Bash"));
-        assert!(working.contains("working"));
+        assert!(working.contains("Working"));
 
         let terminal = render_terminal(&status(AgentState::Stalled));
-        assert!(terminal.contains("stalled"));
+        assert!(terminal.contains("Stalled"));
         assert!(terminal.contains("3m 20s"));
+    }
+
+    #[test]
+    fn alert_and_prompt_headings_drop_claude_too() {
+        let stalled = render_alert(&status(AgentState::Stalled));
+        assert!(!stalled.contains("Claude"));
+        let dead = render_alert(&status(AgentState::Dead));
+        assert!(!dead.contains("Claude"));
+
+        let question = render_prompt(&ask_prompt(&["Red", "Green"]));
+        assert!(question.contains("**Question**"));
+        assert!(!question.contains("Claude is asking"));
+    }
+
+    #[test]
+    fn status_heading_drops_claude_is_and_reads_standalone() {
+        let working = render_working(&status(AgentState::Working));
+        assert!(working.contains("**Working**"));
+        assert!(!working.contains("Claude is"));
+
+        let waiting = render_terminal(&status(AgentState::WaitingForUser));
+        assert!(waiting.contains("**All yours**"));
+        assert!(!waiting.contains("Claude is"));
     }
 
     #[test]
